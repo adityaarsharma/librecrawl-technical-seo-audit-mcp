@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # LibreCrawl MCP — 1-click installer
-# Self-hosted SEO crawler exposed as a Claude MCP server
+# Self-hosted SEO crawler — MCP server for any AI agent
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/adityaarsharma/librecrawl-mcp/main/install.sh | bash
@@ -311,7 +311,7 @@ esac
 # ── Q3: Google Search Console MCP ────────────────────────────────────────────
 echo ""
 echo -e "${YELLOW}[3/3] Install Google Search Console MCP?${NC} (recommended)"
-echo -e "  Lets Claude pull real GSC indexing errors into your audit reports."
+echo -e "  Lets your AI pull real GSC indexing errors into your audit reports."
 echo -e "  1) Yes — install via uvx  (recommended, no extra deps)"
 echo -e "  2) Yes — install via pip"
 echo -e "  3) Skip"
@@ -341,8 +341,8 @@ case "$GSC_CHOICE" in
          _write_mcp_config "$CLAUDE_CODE_CONFIG"    "gsc" "$GSC_SERVER_JSON" ;;
     esac
     echo ""
-    echo -e "  ${YELLOW}GSC auth note:${NC} First time you ask Claude for GSC data, it opens"
-    echo -e "  a browser for Google OAuth. You'll need Google credentials JSON."
+    echo -e "  ${YELLOW}GSC auth note:${NC} First time your AI agent requests GSC data, it opens"
+    echo -e "  a browser for Google OAuth. You'll need a Google credentials JSON file."
     echo -e "  Full guide: github.com/AminForou/mcp-gsc"
     ;;
   3)
@@ -378,7 +378,7 @@ echo ""
 
 # Show manual config only if user skipped auto-config
 if [[ "${CLIENT_CHOICE}" == "5" ]]; then
-  echo -e "${BOLD}  Add to Claude (claude_desktop_config.json or ~/.claude/settings.json):${NC}"
+  echo -e "${BOLD}  Manual MCP config (claude_desktop_config.json, ~/.claude/settings.json, or your client's equivalent):${NC}"
   cat << MANUALJSON
   {
     "mcpServers": {
@@ -417,7 +417,7 @@ echo -e "    Reporting        : librecrawl_append_gsc_section,"
 echo -e "                       librecrawl_visualization_data,"
 echo -e "                       librecrawl_generate_report"
 echo ""
-echo -e "  ${BOLD}First audit:${NC} Ask Claude: \"Audit https://example.com\""
+echo -e "  ${BOLD}First audit:${NC} Ask your AI agent: \"Audit https://example.com\""
 echo -e "  ${BOLD}Test:${NC}"
 echo -e "  pm2 status ${PM2_NAME}"
 echo -e "  docker ps | grep librecrawl"
