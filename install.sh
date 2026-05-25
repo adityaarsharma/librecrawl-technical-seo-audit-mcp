@@ -217,19 +217,141 @@ python3 -m venv "${MCP_DIR}/venv"
 
 log "Python dependencies installed"
 
-# ── Step 5: Register with PM2 ────────────────────────────────────────────────
-info "Step 5/5 — Registering with PM2..."
+# ── Step 5: Configure + Register ─────────────────────────────────────────────
+info "Step 5/5 — 3 quick questions then you're done..."
 
-# Optional: PageSpeed Insights API key
+# Helper: safely merge an MCP server entry into a JSON config file
+_write_mcp_config() {
+  local CONFIG_PATH="$1" SERVER_NAME="$2" SERVER_JSON="$3"
+  WCFG_PATH="$CONFIG_PATH" WCFG_NAME="$SERVER_NAME" WCFG_JSON="$SERVER_JSON" \
+  python3 - << 'PYEOF'
+import json, os
+from pathlib import Path
+config_path = os.environ["WCFG_PATH"]
+server_name = os.environ["WCFG_NAME"]
+server_json_str = os.environ["WCFG_JSON"]
+path = Path(config_path).expanduser()
+path.parent.mkdir(parents=True, exist_ok=True)
+data = {}
+if path.exists():
+    try: data = json.loads(path.read_text())
+    except: data = {}
+if "mcpServers" not in data:
+    data["mcpServers"] = {}
+data["mcpServers"][server_name] = json.loads(server_json_str)
+path.write_text(json.dumps(data, indent=2))
+print(f"    ✓ Added '{server_name}' to {config_path}")
+PYEOF
+}
+
+# ── Q1: PageSpeed Insights API key ───────────────────────────────────────────
+echo ""
+echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BOLD}  Setup — 3 questions${NC}"
+echo -e "${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
 if [[ -z "${PAGESPEED_API_KEY:-}" ]]; then
   echo ""
-  echo -e "${YELLOW}Optional: Google PageSpeed Insights API key${NC}"
-  echo -e "  Enables Core Web Vitals (LCP, CLS, INP, FCP) and Lighthouse scores."
-  echo -e "  Get one free (25k req/day): https://console.cloud.google.com → APIs → PageSpeed Insights API"
-  echo -e "  Press Enter to skip for now."
-  read -rp "  PAGESPEED_API_KEY: " PAGESPEED_API_KEY
+  echo -e "${YELLOW}[1/3] Google PageSpeed Insights API key${NC} (optional)"
+  echo -e "  Enables Core Web Vitals — LCP, CLS, INP, FCP, Lighthouse scores."
+  echo -e "  Free — 25,000 requests/day. Get one:"
+  echo -e "  console.cloud.google.com → APIs & Services → PageSpeed Insights API"
+  echo -e "  Press Enter to skip:"
+  read -rp "  Key: " PAGESPEED_API_KEY </dev/tty || PAGESPEED_API_KEY=""
 fi
 
+# ── Q2: Which AI client to auto-configure ────────────────────────────────────
+echo ""
+echo -e "${YELLOW}[2/3] Auto-add LibreCrawl MCP to your AI client?${NC}"
+echo -e "  1) Claude Desktop  (GUI app — ~/Library/Application Support/Claude/...)"
+echo -e "  2) Claude Code     (CLI — ~/.claude/settings.json)"
+echo -e "  3) Both Claude Desktop + Code"
+echo -e "  4) Cursor          (~/.cursor/mcp.json — uses stdio mode)"
+echo -e "  5) Skip — I'll add it manually"
+read -rp "  Choice [1-5, default 3]: " CLIENT_CHOICE </dev/tty || CLIENT_CHOICE="3"
+CLIENT_CHOICE="${CLIENT_CHOICE:-3}"
+
+# JSON entries for HTTP mode (Claude) and stdio mode (Cursor/Codex)
+MCP_HTTP_JSON="{\"type\":\"http\",\"url\":\"http://127.0.0.1:${MCP_PORT}/mcp\"}"
+MCP_STDIO_JSON="{\"command\":\"python3\",\"args\":[\"${MCP_DIR}/server.py\"],\"env\":{\"MCP_TRANSPORT\":\"stdio\",\"LIBRECRAWL_PORT\":\"${LIBRECRAWL_PORT}\",\"PAGESPEED_API_KEY\":\"${PAGESPEED_API_KEY:-}\"}}"
+
+if [[ "$(uname)" == "Darwin" ]]; then
+  CLAUDE_DESKTOP_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+else
+  CLAUDE_DESKTOP_CONFIG="$HOME/.config/Claude/claude_desktop_config.json"
+fi
+CLAUDE_CODE_CONFIG="$HOME/.claude/settings.json"
+CURSOR_CONFIG="$HOME/.cursor/mcp.json"
+
+case "$CLIENT_CHOICE" in
+  1)
+    _write_mcp_config "$CLAUDE_DESKTOP_CONFIG" "librecrawl" "$MCP_HTTP_JSON"
+    log "Claude Desktop configured"
+    echo -e "  ${YELLOW}→ Restart Claude Desktop to activate.${NC}"
+    ;;
+  2)
+    _write_mcp_config "$CLAUDE_CODE_CONFIG" "librecrawl" "$MCP_HTTP_JSON"
+    log "Claude Code configured"
+    ;;
+  3)
+    _write_mcp_config "$CLAUDE_DESKTOP_CONFIG" "librecrawl" "$MCP_HTTP_JSON"
+    _write_mcp_config "$CLAUDE_CODE_CONFIG"    "librecrawl" "$MCP_HTTP_JSON"
+    log "Claude Desktop + Code configured"
+    echo -e "  ${YELLOW}→ Restart Claude Desktop to activate.${NC}"
+    ;;
+  4)
+    _write_mcp_config "$CURSOR_CONFIG" "librecrawl" "$MCP_STDIO_JSON"
+    log "Cursor configured (stdio mode)"
+    ;;
+  5)
+    echo "  Skipped — manual config shown below."
+    ;;
+esac
+
+# ── Q3: Google Search Console MCP ────────────────────────────────────────────
+echo ""
+echo -e "${YELLOW}[3/3] Install Google Search Console MCP?${NC} (recommended)"
+echo -e "  Lets Claude pull real GSC indexing errors into your audit reports."
+echo -e "  1) Yes — install via uvx  (recommended, no extra deps)"
+echo -e "  2) Yes — install via pip"
+echo -e "  3) Skip"
+read -rp "  Choice [1-3, default 1]: " GSC_CHOICE </dev/tty || GSC_CHOICE="1"
+GSC_CHOICE="${GSC_CHOICE:-1}"
+
+case "$GSC_CHOICE" in
+  1|2)
+    if [[ "$GSC_CHOICE" == "1" ]]; then
+      if ! command -v uvx &>/dev/null; then
+        info "Installing uv (needed for uvx)..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh 2>/dev/null
+        export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+      fi
+      GSC_SERVER_JSON="{\"command\":\"uvx\",\"args\":[\"mcp-search-console\"]}"
+      log "GSC MCP will use uvx"
+    else
+      "${MCP_DIR}/venv/bin/pip" install --quiet mcp-search-console
+      GSC_SERVER_JSON="{\"command\":\"${MCP_DIR}/venv/bin/python3\",\"args\":[\"-m\",\"mcp_search_console\"]}"
+      log "GSC MCP installed via pip"
+    fi
+    # Add GSC to whichever Claude config was chosen
+    case "$CLIENT_CHOICE" in
+      1) _write_mcp_config "$CLAUDE_DESKTOP_CONFIG" "gsc" "$GSC_SERVER_JSON" ;;
+      2) _write_mcp_config "$CLAUDE_CODE_CONFIG"    "gsc" "$GSC_SERVER_JSON" ;;
+      3) _write_mcp_config "$CLAUDE_DESKTOP_CONFIG" "gsc" "$GSC_SERVER_JSON"
+         _write_mcp_config "$CLAUDE_CODE_CONFIG"    "gsc" "$GSC_SERVER_JSON" ;;
+    esac
+    echo ""
+    echo -e "  ${YELLOW}GSC auth note:${NC} First time you ask Claude for GSC data, it opens"
+    echo -e "  a browser for Google OAuth. You'll need Google credentials JSON."
+    echo -e "  Full guide: github.com/AminForou/mcp-gsc"
+    ;;
+  3)
+    echo "  Skipped."
+    ;;
+esac
+
+# ── Register with PM2 ─────────────────────────────────────────────────────────
+echo ""
 pm2 stop "${PM2_NAME}"   2>/dev/null || true
 pm2 delete "${PM2_NAME}" 2>/dev/null || true
 
@@ -245,42 +367,6 @@ pm2 start "${MCP_DIR}/server.py" \
 pm2 save
 log "PM2 process registered and saved (survives reboots)"
 
-# ── Nginx config hint ─────────────────────────────────────────────────────────
-hr
-echo ""
-echo -e "${BOLD}Optional: Nginx reverse proxy${NC}"
-echo "Add this location block to expose MCP over HTTPS:"
-echo ""
-cat << NGINX
-location /librecrawl/ {
-    proxy_pass          http://127.0.0.1:${MCP_PORT}/;
-    proxy_http_version  1.1;
-    proxy_set_header    Host \$host;
-    proxy_read_timeout  600s;
-    proxy_buffering     off;
-    proxy_cache         off;
-    chunked_transfer_encoding on;
-}
-NGINX
-
-# ── Claude config ─────────────────────────────────────────────────────────────
-echo ""
-echo -e "${BOLD}Add to Claude claude_desktop_config.json or settings.json:${NC}"
-echo ""
-cat << JSON
-{
-  "mcpServers": {
-    "librecrawl": {
-      "type": "http",
-      "url": "http://127.0.0.1:${MCP_PORT}/mcp"
-    }
-  }
-}
-JSON
-echo ""
-echo -e "Or via mcp-remote for remote access:"
-echo '  "url": "https://your-domain.com/librecrawl/mcp"'
-
 # ── Done ──────────────────────────────────────────────────────────────────────
 hr
 echo ""
@@ -289,6 +375,33 @@ echo ""
 echo -e "  LibreCrawl UI : http://127.0.0.1:${LIBRECRAWL_PORT}"
 echo -e "  MCP endpoint  : http://127.0.0.1:${MCP_PORT}/mcp"
 echo ""
+
+# Show manual config only if user skipped auto-config
+if [[ "${CLIENT_CHOICE}" == "5" ]]; then
+  echo -e "${BOLD}  Add to Claude (claude_desktop_config.json or ~/.claude/settings.json):${NC}"
+  cat << MANUALJSON
+  {
+    "mcpServers": {
+      "librecrawl": { "type": "http", "url": "http://127.0.0.1:${MCP_PORT}/mcp" }
+    }
+  }
+MANUALJSON
+  echo ""
+  echo -e "  For Cursor/Codex/Windsurf (stdio mode), add to your client's MCP config:"
+  cat << STUDIOJSON
+  {
+    "mcpServers": {
+      "librecrawl": {
+        "command": "python3",
+        "args": ["${MCP_DIR}/server.py"],
+        "env": { "MCP_TRANSPORT": "stdio", "LIBRECRAWL_PORT": "${LIBRECRAWL_PORT}" }
+      }
+    }
+  }
+STUDIOJSON
+  echo ""
+fi
+
 echo -e "  ${BOLD}19 tools available:${NC}"
 echo -e "    Crawl lifecycle  : librecrawl_start_crawl, librecrawl_get_status,"
 echo -e "                       librecrawl_export_results, librecrawl_list_crawls,"
@@ -304,7 +417,8 @@ echo -e "    Reporting        : librecrawl_append_gsc_section,"
 echo -e "                       librecrawl_visualization_data,"
 echo -e "                       librecrawl_generate_report"
 echo ""
-echo -e "  ${BOLD}Test it:${NC}"
+echo -e "  ${BOLD}First audit:${NC} Ask Claude: \"Audit https://example.com\""
+echo -e "  ${BOLD}Test:${NC}"
 echo -e "  pm2 status ${PM2_NAME}"
 echo -e "  docker ps | grep librecrawl"
 echo ""
