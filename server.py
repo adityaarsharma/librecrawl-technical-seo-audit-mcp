@@ -1948,5 +1948,12 @@ def librecrawl_append_gsc_section(report_path: str, gsc_data: dict) -> dict:
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(mcp.streamable_http_app(), host="127.0.0.1", port=MCP_PORT, log_level="info")
+    transport = os.getenv("MCP_TRANSPORT", "http")
+    if transport == "stdio":
+        # Stdio mode: works with Cursor, Windsurf, Codex, Continue.dev, and any MCP client.
+        # Set MCP_TRANSPORT=stdio in your client config (see README for examples).
+        mcp.run()
+    else:
+        # HTTP/streamable mode: default for Claude Desktop + Claude Code via PM2.
+        import uvicorn
+        uvicorn.run(mcp.streamable_http_app(), host="127.0.0.1", port=MCP_PORT, log_level="info")
