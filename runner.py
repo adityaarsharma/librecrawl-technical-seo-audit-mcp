@@ -281,17 +281,10 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     elif fill_enabled:
         fill_summary["reason"] = "no_orphans"
 
-    report_md = _build_report(pages, url, upstream_crawl_id or 0,
-                              site_data=site_data, links=links)
-    md_path = REPORTS_DIR / f"{domain}-{timestamp}.md"
-    md_path.write_text(report_md, encoding="utf-8")
-    state.add_artifact(sid, "md", md_path)
-
-    per_page_csv = REPORTS_DIR / f"{domain}-{timestamp}.per-page.csv"
-    _write_per_page_csv(pages, per_page_csv)
-    state.add_artifact(sid, "per_page_csv", per_page_csv)
-
-    # Re-compute recon AFTER fill so the CSV + completeness reflect actual coverage.
+    # ── v1.6.1: compute completeness FIRST so the report banner can use it ──
+    # Re-compute recon AFTER sitemap_fill so the CSV + completeness reflect
+    # actual coverage. Then build completeness BEFORE _build_report so the
+    # report can render the coverage-warning banner up top when partial.
     recon = _compute_sitemap_reconciliation(pages, sitemap_url)
     recon_csv = REPORTS_DIR / f"{domain}-{timestamp}.sitemap-recon.csv"
     _write_sitemap_recon_csv(recon, recon_csv)
@@ -336,6 +329,19 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
         "audit_complete":       audit_complete,
         "incomplete_reasons":   incomplete_reasons,
     }
+
+    # Now build the Markdown report — passing completeness so it can render
+    # the coverage-warning banner up top when audit is partial.
+    report_md = _build_report(pages, url, upstream_crawl_id or 0,
+                              site_data=site_data, links=links,
+                              completeness=completeness)
+    md_path = REPORTS_DIR / f"{domain}-{timestamp}.md"
+    md_path.write_text(report_md, encoding="utf-8")
+    state.add_artifact(sid, "md", md_path)
+
+    per_page_csv = REPORTS_DIR / f"{domain}-{timestamp}.per-page.csv"
+    _write_per_page_csv(pages, per_page_csv)
+    state.add_artifact(sid, "per_page_csv", per_page_csv)
 
     manifest = _build_checks_manifest(pages, site_data, links or [])
 

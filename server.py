@@ -310,12 +310,20 @@ def _site_check(base_url: str) -> dict:
 # ── Report generator ──────────────────────────────────────────────────────────
 
 def _build_report(pages: list, base_url: str, crawl_id: int,
-                  site_data: dict = None, links: list = None) -> str:
-    """Generate a structured Markdown SEO audit report from crawl export data."""
+                  site_data: dict = None, links: list = None,
+                  completeness: dict = None) -> str:
+    """Generate a structured Markdown SEO audit report from crawl export data.
+
+    v1.6.1: accepts an optional `completeness` dict (the same one the runner
+    surfaces via audit_status). When the audit is partial, a prominent
+    coverage-warning banner is rendered at the top of the report so the
+    summary numbers below are not mistaken for site-wide truth.
+    """
 
     domain = base_url.replace("https://", "").replace("http://", "").rstrip("/")
     now    = datetime.now().strftime("%Y-%m-%d %H:%M")
     total  = len(pages)
+    sitemap_fill_count = sum(1 for p in pages if p.get("source") == "sitemap_fill")
 
     parsed_base = urlparse(base_url)
     base_host   = parsed_base.netloc or domain
@@ -453,8 +461,13 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
             if isinstance(b_images, list) and b_images:
                 broken_img_pages.append((url, len(b_images), b_images[:5]))
 
-            # Orphan page (no inbound links at all)
-            if not linked_from:
+            # Orphan page (no inbound links at all). v1.6.1: skip pages added
+            # by sitemap_fill — those have linked_from=[] because we only
+            # fetched them once, didn't crawl FROM them. They're listed in
+            # the sitemap.xml so the sitemap IS the inbound signal. Marking
+            # them all as orphans would inflate the count by the entire
+            # sitemap_fill set (false positive).
+            if not linked_from and p.get("source") != "sitemap_fill":
                 orphan_pages.append(url)
 
             # Redirect chain (page itself underwent >1 redirect to get here)
@@ -520,6 +533,37 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
     lines.append(f"# SEO Audit Report — {domain}")
     lines.append(f"**Generated:** {now}  |  **Crawl ID:** {crawl_id}  |  **Pages:** {total}\n")
     sep()
+
+    # ── v1.6.1: Coverage warning banner ───────────────────────────────────────
+    # When the audit is partial — max_pages cap hit, sitemap URLs missed, etc. —
+    # surface that fact at the very top so the summary scorecard below isn't
+    # mistaken for site-wide truth. Numbers in the scorecard are over the
+    # CRAWLED set only (a sample of the site).
+    if completeness and not completeness.get("audit_complete", True):
+        reasons = completeness.get("incomplete_reasons") or []
+        sitemap_total      = completeness.get("sitemap_total") or 0
+        sitemap_only_count = completeness.get("sitemap_only_count") or 0
+        coverage_pct       = completeness.get("sitemap_coverage_pct")
+        lines.append("> ## ⚠️ Partial Coverage — Numbers Below Are Sample-Based")
+        lines.append(">")
+        lines.append(f"> This audit covered **{total} pages** of the site, "
+                     "not the full domain. The counts in the **Summary** "
+                     "scorecard reflect only what was crawled. The same metric "
+                     "computed over a fuller crawl can return very different numbers.")
+        lines.append(">")
+        if sitemap_total:
+            lines.append(f"> - **Sitemap coverage:** {sitemap_total - sitemap_only_count}/{sitemap_total} "
+                         f"sitemap URLs in the audit ({coverage_pct}%). "
+                         f"{sitemap_only_count} sitemap URLs were not reached.")
+        if sitemap_fill_count:
+            lines.append(f"> - **Sitemap-fill pages:** {sitemap_fill_count} of the "
+                         f"{total} pages were added via the lightweight sitemap "
+                         f"fill (no inbound/outbound link graph — orphan flag "
+                         f"is disabled for these).")
+        for r in reasons:
+            lines.append(f"> - {r}")
+        lines.append("")
+        sep()
 
     # ── Summary scorecard ─────────────────────────────────────────────────────
     h(2, "📊 Summary")
@@ -1235,7 +1279,8 @@ def _build_checks_manifest(pages: list, site_data: dict, links: list) -> dict:
             no_alt = sum(1 for i in imgs if isinstance(i, dict) and not (i.get("alt") or "").strip())
             if no_alt: fails["missing_alt_pages"] += 1
         if isinstance(bimg, list) and bimg: fails["broken_img_pages"] += 1
-        if not lkfrm:                   fails["orphan_pages"] += 1
+        if not lkfrm and p.get("source") != "sitemap_fill":
+            fails["orphan_pages"] += 1
         if isinstance(rdr, list) and len(rdr) > 1: fails["redirect_chains"] += 1
         og_t = og.get("og:title") or og.get("title") or ""
         og_d = og.get("og:description") or og.get("description") or ""
@@ -1414,7 +1459,7 @@ _PER_PAGE_CHECKS = [
     ("noindex",             lambda p: "noindex" in (p.get("robots") or "").lower()),
     ("large_page_500kb",    lambda p: (p.get("size") or 0) > 500_000),
     ("missing_viewport",    lambda p: not (p.get("viewport") or "").strip() and str(p.get("status_code","")).startswith("2")),
-    ("orphan_page",         lambda p: not (p.get("linked_from") or []) and str(p.get("status_code","")).startswith("2")),
+    ("orphan_page",         lambda p: not (p.get("linked_from") or []) and str(p.get("status_code","")).startswith("2") and p.get("source") != "sitemap_fill"),
     ("redirect_chain",      lambda p: isinstance(p.get("redirects"), list) and len(p.get("redirects") or []) > 1),
     ("status_4xx",          lambda p: str(p.get("status_code","")).startswith("4")),
     ("status_5xx",          lambda p: str(p.get("status_code","")).startswith("5")),
