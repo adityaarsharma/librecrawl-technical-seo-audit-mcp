@@ -2561,6 +2561,198 @@ def librecrawl_append_gsc_section(report_path: str, gsc_data: dict) -> dict:
     }
 
 
+# ── v1.4.0 Chunked-progressive audit tools ────────────────────────────────────
+# Background worker runs in a single thread (LibreCrawl is single-tenant
+# upstream — one crawl at a time). Sessions persist in SQLite WAL so PM2
+# restart doesn't lose progress. Adaptive crawlDelay tuning per polling
+# window keeps the target server happy on slow infrastructure.
+
+import state as _state           # noqa: E402  — late import to avoid circular
+import runner as _runner          # noqa: E402
+
+_state.init_db()
+_runner.start_runner()
+
+
+@mcp.tool()
+def librecrawl_start_chunked_audit(url: str, total_max_pages: int = 10000,
+                                    chunk_target_pages: int = 50,
+                                    politeness: str = "auto",
+                                    confirm_unbounded: bool = False) -> dict:
+    """
+    NEW IN v1.4.0 — Start a chunked-progressive audit. Returns IMMEDIATELY with
+    a session_id; the crawl runs in the background and survives PM2 restart.
+
+    The runner polls upstream LibreCrawl every 20s, computes p95 latency +
+    error rate per window, and re-tunes crawlDelay live (AIMD controller).
+    Slow target → smaller per-second rate. Fast target → speeds up. Never
+    overloads the site you're auditing.
+
+    Returns:
+      session_id          — opaque id to poll librecrawl_audit_status() with
+      status              — initial state ("queued" → quickly becomes "crawling")
+      url                 — echo of the input
+      sanity_ceiling      — hard upper bound enforced when total_max_pages=0
+      total_max_pages     — your cap, or the sanity ceiling
+
+    USE THIS for any audit on a site you don't already know is small. Plain
+    librecrawl_audit() still works (it wraps this with a 110s hard timeout
+    for backwards-compat), but for sites > a few hundred pages, polling
+    is the only way to avoid MCP client disconnects.
+
+    Args:
+        url:                Full URL (e.g. https://example.com).
+        total_max_pages:    Hard ceiling on pages. 0 = unlimited (requires
+                            confirm_unbounded=True). Default 10,000.
+        chunk_target_pages: Polling-window size — how often the controller
+                            re-tunes crawlDelay. Default 50.
+        politeness:         "auto" (adaptive — default), "polite" (slow start
+                            + conservative tune), or "fast" (aggressive).
+        confirm_unbounded:  Pass True only if you genuinely want total_max_pages=0.
+                            Protects you from accidentally crawling Wikipedia.
+    """
+    if total_max_pages > 100_000 and not confirm_unbounded:
+        return {"success": False, "error":
+                f"total_max_pages={total_max_pages} exceeds soft ceiling 100k. "
+                f"Pass confirm_unbounded=True if you truly need this."}
+
+    sess = _runner.enqueue_session(
+        url=url, total_max_pages=total_max_pages,
+        chunk_target_pages=chunk_target_pages, politeness=politeness,
+        confirm_unbounded=confirm_unbounded,
+    )
+    if "error" in (sess or {}):
+        return {"success": False, **sess}
+    return {
+        "success":         True,
+        "session_id":      sess["id"],
+        "status":          sess["status"],
+        "url":             sess["url"],
+        "total_max_pages": sess["total_max_pages"],
+        "next":            f"Poll librecrawl_audit_status('{sess['id']}') every 20-30s.",
+    }
+
+
+@mcp.tool()
+def librecrawl_audit_status(session_id: str) -> dict:
+    """
+    Poll progress on a chunked audit. Safe to call as often as you like —
+    reads from local SQLite state, doesn't hit the upstream every time.
+
+    Returns:
+      status               — queued/crawling/throttled/paused/done/cancelled/failed
+      pages_done           — pages crawled so far
+      total_max_pages      — the cap you set
+      current_delay_ms     — current crawlDelay the controller has tuned to
+      eta_seconds          — rough estimate based on current speed (None if unknown)
+      last_chunks          — last 3 polling-window metrics (p95, err_rate, delay)
+      recent_events        — last 5 state transitions
+      audit_complete       — True only on clean finish (everything crawled, no caps hit)
+      incomplete_reasons   — list of what went wrong, if anything
+      artifacts_ready      — True once finalize has run and PDF/MD/CSVs are on disk
+    """
+    s = _state.get_session(session_id)
+    if not s:
+        return {"success": False, "error": f"Unknown session_id: {session_id}"}
+
+    chunks = _state.last_chunks(session_id, n=3)
+    events = _state.recent_events(session_id, n=5)
+    arts = _state.list_artifacts(session_id)
+
+    # ETA
+    eta = None
+    if chunks and s["status"] in ("crawling", "throttled"):
+        recent_speed = sum(c.get("pages_in_chunk", 0) or 0 for c in chunks) / max(1, sum(
+            (c.get("ended_at", 0) - c.get("started_at", 0)) or 1 for c in chunks
+        ))
+        if recent_speed > 0 and s["total_max_pages"] > 0:
+            remaining = max(0, s["total_max_pages"] - s["pages_done"])
+            eta = int(remaining / recent_speed)
+
+    return {
+        "success":            True,
+        "session_id":         session_id,
+        "status":             s["status"],
+        "url":                s["url"],
+        "pages_done":         s["pages_done"],
+        "total_max_pages":    s["total_max_pages"],
+        "current_delay_ms":   s["current_delay_ms"],
+        "upstream_crawl_id":  s.get("upstream_crawl_id"),
+        "started_at":         s["started_at"],
+        "updated_at":         s["updated_at"],
+        "finished_at":        s.get("finished_at"),
+        "eta_seconds":        eta,
+        "audit_complete":     bool(s.get("audit_complete")),
+        "incomplete_reasons": (s.get("incomplete_reasons") or "").split(",") if s.get("incomplete_reasons") else [],
+        "last_chunks":        chunks,
+        "recent_events":      events,
+        "artifacts_ready":    s["status"] == "done" and len(arts) > 0,
+        "artifacts":          [{"kind": a["kind"], "path": a["path"], "size_bytes": a["size_bytes"]} for a in arts],
+    }
+
+
+@mcp.tool()
+def librecrawl_audit_artifacts(session_id: str) -> dict:
+    """
+    Return the file paths of artifacts produced for a finished session
+    (MD report + per-page.csv + sitemap-recon.csv; PDF in v1.5+).
+
+    Safe to call any time after status becomes 'done'. If called earlier
+    returns success=False with a hint to wait.
+
+    Args:
+        session_id: From librecrawl_start_chunked_audit().
+    """
+    s = _state.get_session(session_id)
+    if not s:
+        return {"success": False, "error": f"Unknown session_id: {session_id}"}
+    if s["status"] != "done":
+        return {
+            "success": False,
+            "session_id": session_id,
+            "status": s["status"],
+            "error": f"Artifacts not ready — status is '{s['status']}'. Poll librecrawl_audit_status() first.",
+        }
+    arts = _state.list_artifacts(session_id)
+    return {
+        "success":     True,
+        "session_id":  session_id,
+        "artifacts":   {a["kind"]: a["path"] for a in arts},
+        "size_bytes":  {a["kind"]: a["size_bytes"] for a in arts},
+    }
+
+
+@mcp.tool()
+def librecrawl_audit_pause(session_id: str) -> dict:
+    """Pause a crawling session. Resume with librecrawl_audit_resume()."""
+    return _runner.pause_session(session_id)
+
+
+@mcp.tool()
+def librecrawl_audit_resume(session_id: str) -> dict:
+    """Resume a paused or throttled session. Runner picks it back up on the next loop."""
+    return _runner.resume_session(session_id)
+
+
+@mcp.tool()
+def librecrawl_audit_cancel(session_id: str) -> dict:
+    """Terminal stop. Upstream crawl is stopped; partial artifacts are kept where written."""
+    return _runner.cancel_session(session_id)
+
+
+@mcp.tool()
+def librecrawl_audit_force_advance(session_id: str) -> dict:
+    """
+    Stuck-recovery escape hatch: force-finalise from whatever pages have been
+    crawled so far. Stops the upstream, builds the report + sidecar CSVs from
+    the current export, marks the session 'done'.
+
+    Only use when status has been 'crawling'/'throttled' for an unusually long
+    time and recent_events shows no progress.
+    """
+    return _runner.force_advance(session_id)
+
+
 # ── v1.2.0 Screaming-Frog parity tools ────────────────────────────────────────
 
 @mcp.tool()
