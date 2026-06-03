@@ -2919,7 +2919,9 @@ _runner.start_runner()
 def librecrawl_start_chunked_audit(url: str, total_max_pages: int = 10000,
                                     chunk_target_pages: int = 50,
                                     politeness: str = "auto",
-                                    confirm_unbounded: bool = False) -> dict:
+                                    confirm_unbounded: bool = False,
+                                    fill_sitemap_orphans: bool = True,
+                                    sitemap_fill_cap: int = 500) -> dict:
     """
     NEW IN v1.4.0 — Start a chunked-progressive audit. Returns IMMEDIATELY with
     a session_id; the crawl runs in the background and survives PM2 restart.
@@ -2951,6 +2953,16 @@ def librecrawl_start_chunked_audit(url: str, total_max_pages: int = 10000,
                             + conservative tune), or "fast" (aggressive).
         confirm_unbounded:  Pass True only if you genuinely want total_max_pages=0.
                             Protects you from accidentally crawling Wikipedia.
+        fill_sitemap_orphans: NEW IN v1.6 — after the main crawl finishes,
+                            lightweight-fetch any sitemap URLs that weren't
+                            crawled via internal-link traversal. Closes the
+                            coverage gap from LibreCrawl's maxDepth/orphan
+                            limitation. Default True. Set False for max speed
+                            on sites where you don't care about sitemap-only URLs.
+        sitemap_fill_cap:   Hard ceiling on orphans to fill (default 500).
+                            Larger sitemaps surface a cap_hit flag in the
+                            sitemap_fill event. Bump only when you genuinely
+                            need exhaustive coverage on a huge site.
     """
     if total_max_pages > 100_000 and not confirm_unbounded:
         return {"success": False, "error":
@@ -2961,6 +2973,10 @@ def librecrawl_start_chunked_audit(url: str, total_max_pages: int = 10000,
         url=url, total_max_pages=total_max_pages,
         chunk_target_pages=chunk_target_pages, politeness=politeness,
         confirm_unbounded=confirm_unbounded,
+        extra_settings={
+            "fill_sitemap_orphans": bool(fill_sitemap_orphans),
+            "sitemap_fill_cap":     int(sitemap_fill_cap),
+        },
     )
     if "error" in (sess or {}):
         return {"success": False, **sess}

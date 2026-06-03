@@ -225,6 +225,7 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
 
     sess = state.get_session(sid)
     url = sess["url"]
+    settings = sess.get("settings", {}) or {}
     try:
         pages, links = libreclient.export_pages(upstream_crawl_id)
     except Exception as e:
@@ -242,6 +243,44 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     domain = url.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
+
+    # ── v1.6 sitemap-orphan fill ─────────────────────────────────────────────
+    # LibreCrawl upstream only traverses from a single seed URL via internal
+    # links up to maxDepth, so any sitemap URLs that aren't reachable that way
+    # never get crawled. Before we build the report, do a lightweight HTTP
+    # fetch on those orphans and merge them into the pages list — the
+    # downstream report engine + checks_manifest then treats them as
+    # first-class crawled pages. Opt-out via session setting.
+    sitemap_url = (site_data.get("sitemap") or {}).get("url") or f"{url.rstrip('/')}/sitemap.xml"
+    pre_recon = _compute_sitemap_reconciliation(pages, sitemap_url)
+
+    fill_enabled = bool(settings.get("fill_sitemap_orphans", True))
+    fill_cap = int(settings.get("sitemap_fill_cap", 500))
+    fill_summary = {"attempted": 0, "skipped_disabled": not fill_enabled}
+
+    if fill_enabled and pre_recon.get("sitemap_only_count", 0) > 0:
+        try:
+            import sitemap_fill
+            fill_result = sitemap_fill.fill_sitemap_orphans(
+                pre_recon.get("sitemap_only", []),
+                max_workers=10, timeout_seconds=8.0, cap=fill_cap,
+            )
+            new_pages = fill_result.get("pages_added", []) or []
+            pages = pages + new_pages
+            fill_summary = {
+                "attempted":     fill_result.get("attempted", 0),
+                "missed_total":  fill_result.get("missed_total", 0),
+                "cap_hit":       fill_result.get("cap_hit", False),
+                "success_count": fill_result.get("success_count", 0),
+                "broken_count":  fill_result.get("broken_count", 0),
+            }
+            state.log_event(sid, "sitemap_fill", fill_summary)
+        except Exception as e:
+            state.log_event(sid, "sitemap_fill_failed", str(e))
+            fill_summary = {"attempted": 0, "error": str(e)}
+    elif fill_enabled:
+        fill_summary["reason"] = "no_orphans"
+
     report_md = _build_report(pages, url, upstream_crawl_id or 0,
                               site_data=site_data, links=links)
     md_path = REPORTS_DIR / f"{domain}-{timestamp}.md"
@@ -252,7 +291,7 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     _write_per_page_csv(pages, per_page_csv)
     state.add_artifact(sid, "per_page_csv", per_page_csv)
 
-    sitemap_url = (site_data.get("sitemap") or {}).get("url") or f"{url.rstrip('/')}/sitemap.xml"
+    # Re-compute recon AFTER fill so the CSV + completeness reflect actual coverage.
     recon = _compute_sitemap_reconciliation(pages, sitemap_url)
     recon_csv = REPORTS_DIR / f"{domain}-{timestamp}.sitemap-recon.csv"
     _write_sitemap_recon_csv(recon, recon_csv)
