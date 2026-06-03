@@ -296,6 +296,53 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
         # the .md report + per-page CSV are the primary artifacts.
         state.log_event(sid, "external_links_audit_failed", str(e))
 
+    # Content audit (v1.5) — paragraph-level checks (readability, AI-tells,
+    # passive voice, lorem ipsum, boilerplate). Fetches first 50 pages by
+    # default; capped to stay polite to the target. Best-effort.
+    try:
+        import content_audit
+        ca_csv = REPORTS_DIR / f"{domain}-{timestamp}.content-audit.csv"
+        ca_summary = content_audit.audit_content(pages, ca_csv, limit=50)
+        state.add_artifact(sid, "content_audit_csv", ca_csv)
+        state.log_event(sid, "content_audited", {
+            "pages_audited": ca_summary.get("pages_audited", 0),
+            "by_check": ca_summary.get("by_check", {}),
+        })
+    except Exception as e:
+        state.log_event(sid, "content_audit_failed", str(e))
+
+    # Extended SEO checks (v1.5) — security headers, mixed content, soft-404,
+    # hreflang return-tag, sitemap cross-checks, canonical chains, URL quality.
+    try:
+        import extended_checks
+        ec_csv = REPORTS_DIR / f"{domain}-{timestamp}.extended-checks.csv"
+        ec_summary = extended_checks.run_extended_checks(
+            pages, url, ec_csv, links=links, limit=50,
+        )
+        state.add_artifact(sid, "extended_checks_csv", ec_csv)
+        state.log_event(sid, "extended_checks_done", {
+            "findings": ec_summary.get("findings", 0),
+            "by_check": ec_summary.get("by_check", {}),
+        })
+    except Exception as e:
+        state.log_event(sid, "extended_checks_failed", str(e))
+
+    # PDF report (v1.5) — Aditya-branded WeasyPrint render of the MD report.
+    # Last so it includes all the analysis above.
+    try:
+        import pdf_report
+        pdf_path = REPORTS_DIR / f"{domain}-{timestamp}.pdf"
+        pdf_meta = pdf_report.render_pdf(report_md, pdf_path, base_url=url)
+        state.add_artifact(sid, "pdf", pdf_path)
+        state.log_event(sid, "pdf_generated", {
+            "pages": pdf_meta.get("pages", 0),
+            "size_bytes": pdf_meta.get("size_bytes", 0),
+        })
+    except Exception as e:
+        # PDF failure must NOT kill finalize — the MD + CSVs are the primary
+        # artifacts.
+        state.log_event(sid, "pdf_generation_failed", str(e))
+
     state.log_event(sid, "finalized", {
         "pages": len(pages),
         "delay_at_finish_ms": last_delay_ms,

@@ -1616,6 +1616,16 @@ def librecrawl_audit(url: str, max_pages: int = 0) -> dict:
     recon         = _compute_sitemap_reconciliation(pages, sitemap_url)
     recon_meta    = _write_sitemap_recon_csv(recon, recon_csv)
 
+    # PDF (v1.5) — Aditya-branded WeasyPrint render. Best-effort; failure
+    # does NOT break the audit (.md remains the primary artifact).
+    pdf_meta = None
+    try:
+        import pdf_report
+        pdf_path = REPORTS_DIR / f"{domain}-{timestamp}.pdf"
+        pdf_meta = pdf_report.render_pdf(report_md, pdf_path, base_url=url)
+    except Exception as e:
+        pdf_meta = {"error": f"pdf_render_failed: {e}"}
+
     # Completeness + checks manifest
     completeness = _compute_crawl_completeness(
         crawl_id, max_pages, len(pages), last_status, started_at, deadline
@@ -1632,6 +1642,7 @@ def librecrawl_audit(url: str, max_pages: int = 0) -> dict:
         "crawl_id": crawl_id,
         "pages_crawled": len(pages),
         "report_file": str(report_path),
+        "pdf_report":  pdf_meta,
         "per_page_csv": per_page_meta,
         "sitemap_reconciliation_csv": recon_meta,
         "sitemap_reconciliation": {
@@ -2861,6 +2872,62 @@ def librecrawl_report_content(report_path: str, max_chars: int = 200_000) -> dic
         "truncated":    truncated,
         "content":      body[:max_chars],
     }
+
+
+@mcp.tool()
+def librecrawl_audit_pdf(report_path: str, base_url: str = "") -> dict:
+    """
+    NEW IN v1.5 — convert a previously-generated Markdown audit report to a
+    branded PDF.
+
+    The PDF is rendered with WeasyPrint using the LibreCrawl MCP branded
+    template (Aditya Sharma footer, accent #2563eb, sans-serif body) and
+    written next to the input .md as <domain>-<ts>.pdf.
+
+    USE THIS when:
+      - You have an old .md report from a previous audit and want a PDF
+      - You want to regenerate the PDF after edits to the .md
+      - The audit's auto-PDF pass failed and you want to retry
+
+    Args:
+        report_path: Path to a .md report inside REPORTS_DIR.
+        base_url:    Optional. Audited site URL — improves the page header.
+                     If omitted, parsed from the filename.
+
+    Returns: {success, pdf_path, size_bytes, pages, generated}.
+    """
+    import pdf_report
+    p = Path(report_path).resolve()
+    if not str(p).startswith(str(REPORTS_DIR.resolve())):
+        return {"success": False, "error": f"Path must be within REPORTS_DIR ({REPORTS_DIR})"}
+    if not p.exists():
+        return {"success": False, "error": f"File not found: {report_path}"}
+    if p.suffix.lower() != ".md":
+        return {"success": False, "error": "Input must be a .md file"}
+
+    try:
+        md_text = p.read_text(encoding="utf-8")
+    except Exception as e:
+        return {"success": False, "error": f"Read failed: {e}"}
+
+    if not base_url:
+        # Derive from filename: <domain>-<ts>.md
+        stem = p.stem
+        # Strip trailing timestamp segment if present
+        if "-" in stem:
+            base_url = "https://" + stem.rsplit("-", 1)[0]
+        else:
+            base_url = "https://" + stem
+
+    pdf_path = p.with_suffix(".pdf")
+    try:
+        meta = pdf_report.render_pdf(md_text, pdf_path, base_url=base_url)
+    except Exception as e:
+        return {"success": False, "error": f"PDF render failed: {e}"}
+
+    return {"success": True, "pdf_path": meta["path"],
+            "size_bytes": meta["size_bytes"],
+            "pages": meta["pages"], "generated": meta["generated"]}
 
 
 @mcp.tool()
