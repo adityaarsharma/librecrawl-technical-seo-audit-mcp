@@ -3439,9 +3439,12 @@ def librecrawl_external_links_audit(crawl_id: int, max_workers: int = 10,
     server, last_modified, source_pages_count, first_source, first_anchor,
     all_sources_pipe.
 
-    Status classes: ok / ok_after_redirect / redirect / forbidden / not_found
-    / gone / client_error_4xx / server_error_5xx / timeout / dns_error /
-    ssl_error / connection_refused / malformed_url / protocol_error / skipped.
+    Status classes (v1.9.1 — every value here is a documented bucket, no
+    catch-all "connect_error" anymore): ok / ok_after_redirect / redirect /
+    forbidden / not_found / gone / client_error_4xx / server_error_5xx /
+    timeout / dns_error / connection_refused / network_unreachable /
+    ssl_error / connection_failed / malformed_url / protocol_error /
+    transport_error / no_response / skipped.
 
     USE THIS when asked to:
     - "check all external links", "broken external links", "outbound link audit"
@@ -3672,7 +3675,8 @@ def librecrawl_audit_zip(session_id: str, auto_cleanup: bool = True) -> dict:
         ]
         for art in arts:
             summary_lines.append(f"  - {art['kind']:25s}  {_Path(art['path']).name}")
-        zf.writestr("SUMMARY.txt", "\n".join(summary_lines) + "\n")
+        summary_text = "\n".join(summary_lines) + "\n"
+        zf.writestr("SUMMARY.txt", summary_text)
 
         for art in arts:
             src = _Path(art["path"])
@@ -3682,14 +3686,34 @@ def librecrawl_audit_zip(session_id: str, auto_cleanup: bool = True) -> dict:
             zf.write(src, arcname=src.name)
             files_added.append({"kind": art["kind"], "name": src.name, "bytes": src.stat().st_size})
 
+    # v1.9.1 — include SUMMARY.txt in the file listing + count. Previous file_count
+    # was len(files_added) which missed it. Now bundle = artifacts + SUMMARY.txt.
+    files_added.insert(0, {
+        "kind": "summary",
+        "name": "SUMMARY.txt",
+        "bytes": len(summary_text.encode("utf-8")),
+    })
+
     zip_bytes = buf.getvalue()
     sha256 = _hl.sha256(zip_bytes).hexdigest()
     filename = f"{domain}-{int(s.get('finished_at') or s.get('updated_at') or 0)}.zip"
     content_b64 = _b64.b64encode(zip_bytes).decode("ascii")
 
+    # v1.9.1 — also write the zip to REPORTS_DIR so clients that prefer a
+    # filesystem download have a path to grab. With auto_cleanup=True the
+    # file is unlinked immediately after the response is built; the path is
+    # for THIS response only. With auto_cleanup=False it persists.
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    zip_path = REPORTS_DIR / filename
+    try:
+        zip_path.write_bytes(zip_bytes)
+        zip_path_str = str(zip_path)
+    except Exception as e:
+        zip_path_str = f"error_writing_zip: {e}"
+
     cleanup = {"session_rows": None, "files_deleted": 0, "upstream": "skipped"}
     if auto_cleanup:
-        # Wipe artifact files on disk
+        # Wipe artifact files on disk (the zip file IS one of them now too)
         for art in arts:
             try:
                 p = _Path(art["path"])
@@ -3718,6 +3742,13 @@ def librecrawl_audit_zip(session_id: str, auto_cleanup: bool = True) -> dict:
                 pass
             if not api_ok:
                 cleanup["upstream"] = _wipe_upstream_crawl_record(upstream_id)
+        # And finally unlink the zip itself — caller has already received the bytes
+        try:
+            if zip_path.exists():
+                zip_path.unlink()
+                cleanup["zip_file_deleted"] = True
+        except Exception:
+            cleanup["zip_file_deleted"] = False
 
     return {
         "success":         True,
@@ -3729,8 +3760,12 @@ def librecrawl_audit_zip(session_id: str, auto_cleanup: bool = True) -> dict:
         "missing":         missing,
         "sha256":          sha256,
         "content_base64":  content_b64,
+        "zip_path":        zip_path_str,
+        "zip_path_persistent": (not auto_cleanup),
         "cleanup":         cleanup,
-        "note":            "Server-side state wiped. This response IS your only copy — save the zip locally." if auto_cleanup else "auto_cleanup=False — call again with True (or librecrawl_wipe_everything) to actually wipe.",
+        "note":            ("Server-side state wiped (including zip file). The base64 IS your only copy — save it locally."
+                            if auto_cleanup
+                            else f"auto_cleanup=False — zip persists at {zip_path_str} until you call librecrawl_audit_zip() again with True or librecrawl_wipe_everything()."),
     }
 
 

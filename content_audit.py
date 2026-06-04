@@ -297,7 +297,7 @@ async def _fetch_all(urls: list, max_workers: int, timeout_s: float) -> list:
 
 # ── Public entry point ───────────────────────────────────────────────────────
 
-def audit_content(pages: list, output_path: Path, limit: int = 50,
+def audit_content(pages: list, output_path: Path, limit: int = 250,
                    max_workers: int = 5,
                    timeout_seconds: float = 8.0) -> dict:
     """

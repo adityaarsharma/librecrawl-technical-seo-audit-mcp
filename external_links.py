@@ -187,13 +187,26 @@ async def _validate_one(target: str, client: httpx.AsyncClient,
             error = "timeout"
             r = None
         except httpx.ConnectError as e:
+            # v1.9.1 — replace the generic "connect_error" catch-all with
+            # specific subtypes that match the documented status class set
+            # so the CSV / report taxonomy stays consistent.
             msg = str(e).lower()
-            if "name or service not known" in msg or "nodename nor servname" in msg or "name resolution" in msg:
+            if ("name or service not known" in msg or "nodename nor servname" in msg
+                    or "name resolution" in msg or "no address associated" in msg
+                    or "getaddrinfo failed" in msg or "temporary failure in name resolution" in msg):
                 error = "dns_error"
             elif "refused" in msg:
                 error = "connection_refused"
+            elif "network is unreachable" in msg or "no route to host" in msg:
+                error = "network_unreachable"
+            elif "ssl" in msg or "certificate" in msg or "tlsv1" in msg or "handshake" in msg:
+                error = "ssl_error"
+            elif "timed out" in msg or "timeout" in msg:
+                error = "timeout"
             else:
-                error = "connect_error"
+                # Unmatched ConnectError — record the raw classname for forensics
+                # rather than dropping into a generic bucket.
+                error = "connection_failed"
             r = None
 
         if r is None and error is None:
@@ -367,12 +380,30 @@ def audit_external_links(pages: list, base_url: str, output_path,
 
     csv_meta = _write_csv(results, validate_map, skip_map, output_path)
 
+    # v1.9.1 — surface skip-reason breakdown so the caller can see WHY
+    # external links were excluded (mailto / tel / scheme_javascript /
+    # non_http_scheme / malformed_url / no_host). Counts every reason
+    # without truncation. Sample URLs per reason capped to 5 for brevity.
+    skipped_by_reason = defaultdict(int)
+    skipped_examples = defaultdict(list)
+    for url, reason in skip_map.items():
+        skipped_by_reason[reason] += 1
+        if len(skipped_examples[reason]) < 5:
+            skipped_examples[reason].append(url)
+
     return {
-        "external_links_csv":  csv_meta,
-        "total_external_links": len(targets),
-        "skipped_non_http":    len(skip_map),
-        "by_status_class":     dict(by_class),
-        "broken_count":        len(broken),
-        "redirect_count":      sum(1 for r in results if r["redirect_count"] > 0),
-        "top_broken":          top_broken,
+        "external_links_csv":     csv_meta,
+        "total_external_links":   len(targets),
+        "unique_targets_found":   len(targets) + len(skip_map),  # incl. skipped
+        "validated_count":        len(results),
+        "skipped_total":          len(skip_map),
+        "skipped_by_reason":      dict(sorted(skipped_by_reason.items(),
+                                              key=lambda x: -x[1])),
+        "skipped_examples":       {k: v for k, v in skipped_examples.items()},
+        "by_status_class":        dict(by_class),
+        "broken_count":           len(broken),
+        "redirect_count":         sum(1 for r in results if r["redirect_count"] > 0),
+        "top_broken":             top_broken,
+        # Back-compat alias — older callers still read this
+        "skipped_non_http":       len(skip_map),
     }
