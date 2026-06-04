@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+venv/
+.venv/
+env/
+
+# Editor
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# Test artifacts (these belong on the live server, never in the repo)
+/librecrawl-reports/
+/librecrawl-state.db*
+
+# Local
+*.bak
+*.bak-*
+.env
+.env.local
