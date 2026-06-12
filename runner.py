@@ -39,7 +39,9 @@ MIN_DELAY_MS             = 0
 MAX_DELAY_MS             = 5000
 SANITY_CEILING_PAGES     = 100_000   # Override needs confirm_unbounded=True
 UPSTREAM_HEALTH_TIMEOUT  = 600        # 10 min of no-progress → throttled
-HARD_DEADLINE_SECONDS    = 14400      # 4 hr ceiling per session
+HARD_DEADLINE_SECONDS    = 43200      # 12 hr ceiling — full polite crawls of
+                                      # very large heavy sites can run for
+                                      # hours; never abort a real audit early.
 
 
 _runner_thread: threading.Thread | None = None
@@ -255,7 +257,14 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     pre_recon = _compute_sitemap_reconciliation(pages, sitemap_url)
 
     fill_enabled = bool(settings.get("fill_sitemap_orphans", True))
-    fill_cap = int(settings.get("sitemap_fill_cap", 500))
+    # v2.1.0: FULL COVERAGE BY DEFAULT. sitemap_fill_cap=0 (the new default)
+    # means "crawl the ENTIRE sitemap" — bounded only by total_max_pages as a
+    # runaway safety ceiling. No silent page-dropping: anyone who runs the tool
+    # gets every page, every text, every link. Politeness (low concurrency +
+    # delay) keeps it safe on heavy sites; it just takes longer.
+    _raw_cap = int(settings.get("sitemap_fill_cap", 0))
+    _ceiling = sess["total_max_pages"] if sess["total_max_pages"] > 0 else 100_000
+    fill_cap = _raw_cap if _raw_cap > 0 else _ceiling
     fill_summary = {"attempted": 0, "skipped_disabled": not fill_enabled}
 
     if fill_enabled and pre_recon.get("sitemap_only_count", 0) > 0:
@@ -389,11 +398,13 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     try:
         import content_audit
         ca_csv = REPORTS_DIR / f"{domain}-{timestamp}.content-audit.csv"
-        # v2.0.8: limit 50 → 400 so big sites get content analysis on far
-        # more than a 50-page sample; timeout tunable for heavy pages.
+        # v2.1.0: FULL COVERAGE. content_check_limit=0 (new default) → analyze
+        # EVERY crawled page's text (readability, AI-tells, boilerplate), not a
+        # sample. Bounded by len(pages) so it's exactly "all pages".
+        _ca_raw = int(settings.get("content_check_limit", 0))
         ca_summary = content_audit.audit_content(
             pages, ca_csv,
-            limit=int(settings.get("content_check_limit", 400)),
+            limit=_ca_raw if _ca_raw > 0 else len(pages),
             timeout_seconds=float(settings.get("fetch_timeout_s", 20.0)),
         )
         state.add_artifact(sid, "content_audit_csv", ca_csv)
@@ -409,11 +420,13 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     try:
         import extended_checks
         ec_csv = REPORTS_DIR / f"{domain}-{timestamp}.extended-checks.csv"
-        # v2.0.8: limit 50 → 400 + heavy-page timeout so big sites get
-        # extended checks (hreflang/schema/security/perf) on a real sample.
+        # v2.1.0: FULL COVERAGE. extended_check_limit=0 (new default) → run
+        # hreflang/schema/security/perf checks on EVERY crawled page, not a
+        # sample. Bounded by len(pages).
+        _ec_raw = int(settings.get("extended_check_limit", 0))
         ec_summary = extended_checks.run_extended_checks(
             pages, url, ec_csv, links=links,
-            limit=int(settings.get("extended_check_limit", 400)),
+            limit=_ec_raw if _ec_raw > 0 else len(pages),
             timeout_seconds=float(settings.get("fetch_timeout_s", 20.0)),
         )
         state.add_artifact(sid, "extended_checks_csv", ec_csv)

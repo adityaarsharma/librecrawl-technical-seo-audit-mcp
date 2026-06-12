@@ -3109,7 +3109,7 @@ def librecrawl_start_chunked_audit(url: str, total_max_pages: int = 10000,
                                     politeness: str = "auto",
                                     confirm_unbounded: bool = False,
                                     fill_sitemap_orphans: bool = True,
-                                    sitemap_fill_cap: int = 500) -> dict:
+                                    sitemap_fill_cap: int = 0) -> dict:  # v2.1.0: 0 = FULL sitemap (default)
     """
     NEW IN v1.4.0 — Start a chunked-progressive audit. Returns IMMEDIATELY with
     a session_id; the crawl runs in the background and survives PM2 restart.
