@@ -4,6 +4,8 @@
 
 # 🕷️ librecrawl-technical-seo-audit-mcp
 
+[![MCP Toplist](https://mcptoplist.com/badge/pulsemcp%2Fadityaarsharma-librecrawl-seo.svg)](https://mcptoplist.com/server/pulsemcp%2Fadityaarsharma-librecrawl-seo)
+
 ### **The AI-native technical SEO crawler.**
 
 Run a complete on-site SEO audit on any website — straight from Claude, Cursor, Codex, or any Model Context Protocol (MCP) client. **Unlimited pages · 50+ checks · PDF + CSVs · MIT-licensed · self-hosted · ephemeral by design.**
