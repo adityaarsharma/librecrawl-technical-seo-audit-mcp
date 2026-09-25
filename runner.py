@@ -38,6 +38,13 @@ TARGET_ERR_RATE          = 0.02
 MIN_DELAY_MS             = 0
 MAX_DELAY_MS             = 5000
 SANITY_CEILING_PAGES     = 100_000   # Override needs confirm_unbounded=True
+# politeness -> (upstream workers, delay floor ms). Before 2.3.3 the mode was stored and
+# ignored, so every crawl ran upstream's default 5 workers.
+POLITENESS = {
+    "polite": (2, 1500),
+    "auto":   (3, 0),
+    "fast":   (5, 0),
+}
 STATUS_ERROR_LIMIT       = 6          # consecutive failed polls (~2 min) before giving up
 UPSTREAM_HEALTH_TIMEOUT  = 600        # 10 min of no-progress → throttled
 HARD_DEADLINE_SECONDS    = 43200      # 12 hr ceiling — full polite crawls of
@@ -80,13 +87,14 @@ def _run_session(session: dict) -> None:
     """Drive one session from start → done. Synchronous, blocks the worker thread."""
     sid = session["id"]
     settings = session.get("settings", {}) or {}
-    robots_floor_ms = int(settings.get("robots_floor_ms", 0))
+    workers, polite_floor_ms = POLITENESS.get(session.get("politeness") or "auto", POLITENESS["auto"])
+    robots_floor_ms = max(int(settings.get("robots_floor_ms", 0)), polite_floor_ms)
     chunk_no = state.chunk_count(sid)
     started_window = time.time()
     last_seen_crawled = session.get("pages_done", 0)
     total_max = session["total_max_pages"]
     sanity_cap = total_max if total_max > 0 else SANITY_CEILING_PAGES
-    delay_ms = session["current_delay_ms"]
+    delay_ms = max(session["current_delay_ms"], robots_floor_ms)
     last_progress_at = time.time()
     started_session = session.get("started_at") or time.time()
 
@@ -98,6 +106,7 @@ def _run_session(session: dict) -> None:
             session["url"],
             max_pages=total_max if total_max > 0 else 0,
             crawl_delay_s=delay_ms / 1000.0,
+            concurrency=workers,
         )
         if not result.get("success"):
             err = result.get("message", "Upstream rejected start_crawl")

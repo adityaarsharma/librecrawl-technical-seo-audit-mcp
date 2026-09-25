@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.3.3] — 2026-09-25
+
+### Fixed
+- `politeness` did nothing. The mode was stored and never sent upstream, so every crawl ran LibreCrawl's default 5 workers, including "polite" ones. It now sets upstream concurrency and a delay floor: `polite` 2 workers and at least 1.5 s between requests, `auto` 3 workers, `fast` 5 workers. On hostmy.blog, 5 workers pushed server response time from 2.1 s to about 9 s, so every page was flagged slow.
+
 ## [2.3.2] — 2026-09-25
 
 ### Fixed
