@@ -1090,12 +1090,12 @@ def run_extended_checks(pages: list, base_url: str, output_path: Path,
     cap_applied = len(candidates) > limit
     fetch_urls = candidates[:limit]
 
-    if fetch_urls:
-        # v2.0.7: _run_coro() works whether or not an event loop is already
-        # running — fixes extended-checks vanishing from force-advanced audits.
-        results = _run_coro(
-            _fetch_all(fetch_urls, max_workers, timeout_seconds)
-        )
+    # Batched so each batch's responses become small finding rows and are
+    # freed before the next batch; all pages covered without the old OOM.
+    BATCH = 120
+    for _i in range(0, len(fetch_urls), BATCH):
+        _batch = fetch_urls[_i:_i + BATCH]
+        results = _run_coro(_fetch_all(_batch, max_workers, timeout_seconds))
 
         for url, resp, err in results:
             if err or resp is None:
@@ -1123,6 +1123,7 @@ def run_extended_checks(pages: list, base_url: str, output_path: Path,
                 else:
                     sev = "low"
                 findings.append((url, check, sev, detail))
+        results = None  # free this batch's responses before the next batch
 
     # Write CSV
     by_check = defaultdict(int)

@@ -15,6 +15,12 @@
   links, issues or queue rows survive. The old path wrote to a read-only mount and failed silently.
 - **Watchdog purged unrelated rows.** Its fallback SQL matched `crawl_id = ? OR id = ?` on child
   tables; it now matches `crawl_id` only and prefers the REST delete.
+- **Watchdog never purged anything.** Its state cleanup queried an `id` column the child tables do
+  not have, so every run died with `no such column: id` before deleting a row. Child tables now
+  key on `session_id`, and old report files are swept even in a run with no expired session.
+- Content audit and extended checks cover every crawled page again (batched fetch, bounded
+  memory) instead of the first 500, the fetch timeout is 45s, and a `schema-validation.csv`
+  artifact is written for every audit. These were running in production but missing from the repo.
 - Response times were always blank: the export asked for a field upstream does not have.
   Now read from `response_time` (ms).
 - The homepage was counted as an orphan page. The seed is excluded everywhere orphans are counted.

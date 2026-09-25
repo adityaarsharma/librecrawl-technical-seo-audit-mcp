@@ -366,31 +366,24 @@ def audit_content(pages: list, output_path: Path, limit: int = 400,
     target_pages = candidates[:limit]
     target_urls = [p.get("url") for p in target_pages]
 
-    # Fetch all pages concurrently
-    fetch_results = []
-    if target_urls:
-        # v2.0.7: _run_coro() dispatches to a worker thread when an event loop
-        # is ALREADY running (the case when finalize is triggered via the
-        # librecrawl_audit_force_advance MCP tool, which executes inside the
-        # FastMCP/uvicorn async handler). Plain asyncio.run() there throws
-        # "asyncio.run() cannot be called from a running event loop", which
-        # silently dropped content-audit / extended-checks / external-links
-        # from every force-advanced audit. _run_coro() works in BOTH the
-        # runner thread (no loop) and the async handler (loop running).
-        fetch_results = _run_coro(
-            _fetch_all(target_urls, max_workers, timeout_seconds)
-        )
-
-    # Build text-by-url map for boilerplate detection
+    # Build text-by-url map for boilerplate detection, fetched in batches so
+    # we never hold every page's raw HTML at once (the OOM that forced the old
+    # 500-page cap). _run_coro() works whether or not an event loop is already
+    # running, which matters when finalize runs inside audit_force_advance.
     texts_by_url = {}
     errors_by_url = {}
-    for url, html_str, err in fetch_results:
-        if err:
-            errors_by_url[url] = err
-            continue
-        text = _strip_html_to_text(html_str or "")
-        if text:
-            texts_by_url[url] = text
+    BATCH = 120
+    for _i in range(0, len(target_urls), BATCH):
+        _batch = target_urls[_i:_i + BATCH]
+        _results = _run_coro(_fetch_all(_batch, max_workers, timeout_seconds))
+        for _url, _html, _err in _results:
+            if _err:
+                errors_by_url[_url] = _err
+                continue
+            text = _strip_html_to_text(_html or "")
+            if text:
+                texts_by_url[_url] = text
+        _results = None  # free this batch's HTML before fetching the next
 
     boiler_ratios = _compute_boilerplate_ratios(texts_by_url)
 

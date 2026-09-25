@@ -128,12 +128,13 @@ def main() -> int:
             purge_ids.append((sid, reason))
             if upstream:
                 purge_upstream.append(upstream)
-    if not purge_ids:
-        log(f'watchdog: scanned {len(rows)} sessions, 0 to purge')
-        return 0
     for sid, reason in purge_ids:
-        for table in ('events', 'artifacts', 'chunks', 'sessions'):
-            cur.execute(f'DELETE FROM {table} WHERE session_id = ? OR id = ?', (sid, sid))
+        # Child tables key on session_id; only `sessions` has an `id` column.
+        # Querying `id` on a child table raised "no such column: id" and
+        # aborted every run before anything was purged.
+        for table in ('events', 'artifacts', 'chunks'):
+            cur.execute(f'DELETE FROM {table} WHERE session_id = ?', (sid,))
+        cur.execute('DELETE FROM sessions WHERE id = ?', (sid,))
         log(f'watchdog: purged session {sid} ({reason})')
     sdb.commit()
     sdb.close()
@@ -154,7 +155,7 @@ def main() -> int:
         log(f'watchdog: purged {purged_files} orphan files ({purged_bytes} bytes)')
     if purge_upstream:
         _purge_upstream(purge_upstream)
-    log(f'watchdog: cycle complete — purged {len(purge_ids)} sessions')
+    log(f'watchdog: scanned {len(rows)} sessions, purged {len(purge_ids)}')
     return 0
 
 
