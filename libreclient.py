@@ -58,8 +58,10 @@ def start_crawl(url: str, max_pages: int = 0, crawl_delay_s: float = 0.5,
         "crawlExternalLinks": False,
         "concurrency":        concurrency,
     }
-    if max_pages > 0:
-        settings["maxUrls"] = max_pages
+    # Always send maxUrls: leaving it out keeps whatever cap the previous run
+    # saved upstream (a leftover maxUrls of 3 once cut an audit to 3 pages).
+    # The runner enforces its own ceiling on top of this.
+    settings["maxUrls"] = max_pages if max_pages > 0 else 5_000_000
     _client_call("POST", "/api/save_settings", json=settings)
     return _client_call("POST", "/api/start_crawl", json={"url": url})
 

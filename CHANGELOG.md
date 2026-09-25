@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.3.4] — 2026-09-25
+
+### Fixed
+- One legacy call froze the whole server. FastMCP runs sync tools on the event loop, and `librecrawl_audit` / `librecrawl_full_audit_strict` poll for up to 2 hours, so no other client could list tools, poll status or download a zip until they returned. Every sync tool now runs in a worker thread.
+- Legacy crawl tools killed running chunked audits. `librecrawl_audit` and `librecrawl_start_crawl` force-stop the shared upstream crawler before starting, so calling one mid-audit cut that audit short. They now return `crawler_busy` while a chunked audit is active, a second legacy audit is refused instead of stacked, and the chunked runner waits while a legacy crawl owns the crawler.
+- Unbounded chunked audits inherited the last run's page cap. `maxUrls` was only sent when a cap was set, so upstream kept whatever the previous crawl saved (a leftover `maxUrls: 3` once cut an audit to 3 pages). It is now always sent.
+- The chunked-audit docstring claimed `librecrawl_audit` has a 110 s timeout. It does not; the text now says it holds the call open until the crawl ends.
+
 ## [2.3.3] — 2026-09-25
 
 ### Fixed

@@ -593,6 +593,23 @@ MAX_BOOT_REQUEUES = 3  # v2.1.1: a session that crashes the process this many
                        # times is poison — fail it instead of looping forever.
 
 
+def _legacy_crawl_active() -> bool:
+    # Under PM2, server.py runs as __main__, and `import server` would load a
+    # second copy with its own lock. Ask the module that actually serves tools.
+    import sys
+    mod = sys.modules.get("__main__")
+    f = getattr(mod, "_legacy_crawl_active", None)
+    if f is None:
+        try:
+            from server import _legacy_crawl_active as f
+        except Exception:
+            return False
+    try:
+        return bool(f())
+    except Exception:
+        return False
+
+
 def _worker_loop():
     """Pick up queued sessions FIFO. Resume any active-but-not-running on boot."""
     # Boot recovery — anything in non-terminal state gets re-queued, BUT with a
@@ -617,6 +634,13 @@ def _worker_loop():
         queued = state.find_queued_sessions()
         if not queued:
             _wake.wait(timeout=5)
+            _wake.clear()
+            continue
+
+        if _legacy_crawl_active():
+            # A legacy tool owns the shared upstream crawler. Starting now would
+            # either fail with "already in progress" or clobber its settings.
+            _wake.wait(timeout=10)
             _wake.clear()
             continue
 
