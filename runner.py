@@ -223,7 +223,7 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     from server import (_build_report, _site_check, _write_per_page_csv,
                         _write_sitemap_recon_csv, _compute_sitemap_reconciliation,
                         _build_checks_manifest, _compute_crawl_completeness,
-                        REPORTS_DIR)
+                        _safe_domain, _site_hosts, _on_site, REPORTS_DIR)
 
     sess = state.get_session(sid)
     url = sess["url"]
@@ -241,9 +241,25 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
         state.set_status(sid, "failed", "No pages exported")
         return
 
+    # Off-site pages (a redirect or a followed link to another host) are not
+    # part of this site's audit.
+    site_hosts = _site_hosts(url, pages)
+    offsite = [p for p in pages if not _on_site(p.get("url", ""), site_hosts)]
+    if offsite:
+        pages = [p for p in pages if _on_site(p.get("url", ""), site_hosts)]
+        state.log_event(sid, "offsite_pages_dropped",
+                        {"count": len(offsite), "sample": [p.get("url") for p in offsite[:5]]})
+
+    # Upstream reports a "successful" crawl of an unreachable seed as one page
+    # with status 0. That is a failed audit, not a clean one.
+    if not any(int(p.get("status_code") or 0) > 0 for p in pages):
+        state.update_session(sid, incomplete_reasons="seed_unreachable")
+        state.set_status(sid, "failed", "Seed unreachable: no page returned an HTTP status")
+        return
+
     site_data = _site_check(url)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    domain = url.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
+    domain = _safe_domain(url)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
 
     # ── v1.6 sitemap-orphan fill ─────────────────────────────────────────────
@@ -262,12 +278,16 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     # runaway safety ceiling. No silent page-dropping: anyone who runs the tool
     # gets every page, every text, every link. Politeness (low concurrency +
     # delay) keeps it safe on heavy sites; it just takes longer.
+    # The fill tops up to total_max_pages, it never adds another full budget.
     _raw_cap = int(settings.get("sitemap_fill_cap", 0))
     _ceiling = sess["total_max_pages"] if sess["total_max_pages"] > 0 else 100_000
-    fill_cap = _raw_cap if _raw_cap > 0 else _ceiling
+    _remaining = max(0, _ceiling - len(pages))
+    fill_cap = min(_raw_cap, _remaining) if _raw_cap > 0 else _remaining
+    # Sitemaps can list other hosts (CDNs, sister sites). Only fill this site's URLs.
+    _sm_only = [u for u in pre_recon.get("sitemap_only", []) if _on_site(u, site_hosts)]
     fill_summary = {"attempted": 0, "skipped_disabled": not fill_enabled}
 
-    if fill_enabled and pre_recon.get("sitemap_only_count", 0) > 0:
+    if fill_enabled and _sm_only and fill_cap > 0:
         try:
             import sitemap_fill
             # v2.0.9: Screaming-Frog-grade politeness for heavy sites.
@@ -277,7 +297,7 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
             # concurrency (4 workers, SF's 2-5 range) + 500ms jittered
             # per-request delay. All tunable per audit via settings.
             fill_result = sitemap_fill.fill_sitemap_orphans(
-                pre_recon.get("sitemap_only", []),
+                _sm_only,
                 max_workers=int(settings.get("fetch_workers", 4)),
                 timeout_seconds=float(settings.get("fetch_timeout_s", 25.0)),
                 cap=fill_cap,
@@ -297,7 +317,7 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
             state.log_event(sid, "sitemap_fill_failed", str(e))
             fill_summary = {"attempted": 0, "error": str(e)}
     elif fill_enabled:
-        fill_summary["reason"] = "no_orphans"
+        fill_summary["reason"] = "no_orphans" if not _sm_only else "page_budget_spent"
 
     # ── v1.6.1: compute completeness FIRST so the report banner can use it ──
     # Re-compute recon AFTER sitemap_fill so the CSV + completeness reflect
@@ -362,7 +382,7 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
         ext_summary = external_links.audit_external_links(
             pages, url, ext_csv, links=links,
             max_workers=int(settings.get("external_fetch_workers", 8)),
-            timeout_seconds=float(settings.get("fetch_timeout_s", 20.0)),
+            timeout_seconds=float(settings.get("fetch_timeout_s", 45.0)),
         )
         state.add_artifact(sid, "external_links_csv", ext_csv)
         state.log_event(sid, "external_links_audited", {
@@ -398,20 +418,17 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     try:
         import content_audit
         ca_csv = REPORTS_DIR / f"{domain}-{timestamp}.content-audit.csv"
-        # v2.1.1: MEMORY-SAFE cap. content_audit loads each page's full HTML
-        # AND holds 5-word shingles across pages for boilerplate detection —
-        # on a 1900-page x 4.68 MB site that OOM-killed the process, which
-        # PM2 restarted, which re-ran the whole crawl, looping ~37x over 12h
-        # until the hard deadline. Core per-page SEO checks already cover ALL
-        # pages (cheap, from the crawl export); the deep content sample is
-        # capped at 500 to stay within memory. Tunable up via settings for
-        # operators with more RAM. 0 or unset → safe 500 default.
+        # v2.1.2: covers ALL pages. The v2.1.1 500-page cap existed because
+        # holding every page's full HTML OOM-killed the process on a
+        # 1900-page site; content_audit now fetches in batches and keeps only
+        # stripped text, so memory stays bounded. content_check_limit > 0 is
+        # an optional ceiling; 0 or unset means every page.
         _ca_raw = int(settings.get("content_check_limit", 0))
-        _ca_limit = _ca_raw if _ca_raw > 0 else 500
+        _ca_limit = _ca_raw if _ca_raw > 0 else len(pages)
         ca_summary = content_audit.audit_content(
             pages, ca_csv,
             limit=min(_ca_limit, len(pages)),
-            timeout_seconds=float(settings.get("fetch_timeout_s", 20.0)),
+            timeout_seconds=float(settings.get("fetch_timeout_s", 45.0)),
         )
         state.add_artifact(sid, "content_audit_csv", ca_csv)
         state.log_event(sid, "content_audited", {
@@ -426,16 +443,14 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     try:
         import extended_checks
         ec_csv = REPORTS_DIR / f"{domain}-{timestamp}.extended-checks.csv"
-        # v2.1.1: MEMORY-SAFE cap (same OOM fix as content_audit). extended
-        # checks re-fetch each page's HTML for hreflang/schema/security/perf.
-        # Capped at 500 by default; tunable via extended_check_limit. Core
-        # per-page checks still cover ALL pages from the crawl export.
+        # v2.1.2: covers ALL pages, batch-fetched like content_audit.
+        # extended_check_limit > 0 is an optional ceiling.
         _ec_raw = int(settings.get("extended_check_limit", 0))
-        _ec_limit = _ec_raw if _ec_raw > 0 else 500
+        _ec_limit = _ec_raw if _ec_raw > 0 else len(pages)
         ec_summary = extended_checks.run_extended_checks(
             pages, url, ec_csv, links=links,
             limit=min(_ec_limit, len(pages)),
-            timeout_seconds=float(settings.get("fetch_timeout_s", 20.0)),
+            timeout_seconds=float(settings.get("fetch_timeout_s", 45.0)),
         )
         state.add_artifact(sid, "extended_checks_csv", ec_csv)
         state.log_event(sid, "extended_checks_done", {
@@ -444,6 +459,33 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
         })
     except Exception as e:
         state.log_event(sid, "extended_checks_failed", str(e))
+
+    # Schema / structured-data validation. Runs on the json_ld already captured
+    # in the crawl export, so it covers every page with no re-fetch.
+    try:
+        import csv as _csv
+        import schema_validator
+        sch_csv = REPORTS_DIR / f"{domain}-{timestamp}.schema-validation.csv"
+        sch = schema_validator.validate_crawl_schemas(pages)
+        pages_no_schema = max(0, len([p for p in pages
+            if str(p.get("status_code", "")).startswith("2")]) - sch.get("pages_with_schema", 0))
+        with open(sch_csv, "w", newline="", encoding="utf-8") as _f:
+            _w = _csv.writer(_f)
+            _w.writerow(["url", "schema_type", "severity", "check", "detail"])
+            for fnd in sch.get("findings", []):
+                _w.writerow([fnd.get("url", ""), fnd.get("type", ""), fnd.get("severity", ""),
+                             fnd.get("check", ""), fnd.get("detail", "")])
+        state.add_artifact(sid, "schema_validation_csv", sch_csv)
+        state.log_event(sid, "schema_validated", {
+            "pages_with_schema":    sch.get("pages_with_schema", 0),
+            "pages_without_schema": pages_no_schema,
+            "pages_with_errors":    sch.get("pages_with_errors", 0),
+            "total_findings":       sch.get("total_findings", 0),
+            "by_type":              dict(sch.get("by_type", {})),
+            "by_check":             dict(sch.get("by_check", {})),
+        })
+    except Exception as e:
+        state.log_event(sid, "schema_validation_failed", str(e))
 
     # PDF report (v1.5) — Aditya-branded WeasyPrint render of the MD report.
     # Last so it includes all the analysis above.
@@ -555,6 +597,11 @@ def enqueue_session(url: str, total_max_pages: int = 10_000,
                     confirm_unbounded: bool = False,
                     extra_settings: dict | None = None) -> dict:
     """Create a session row and wake the runner. Returns the new session dict."""
+    from server import _seed_gate
+    gate = _seed_gate(url)
+    if gate:
+        return gate
+    url = url.strip()
     if total_max_pages == 0 and not confirm_unbounded:
         return {
             "success": False,

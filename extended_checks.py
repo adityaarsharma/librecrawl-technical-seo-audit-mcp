@@ -53,6 +53,8 @@ from xml.etree import ElementTree as ET
 
 import httpx
 
+from url_guard import guarded_async_client, guarded_get
+
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -601,7 +603,7 @@ def _fetch_sitemap_urls(sitemap_url: str, timeout_s: float = 10.0) -> tuple:
     v1.8: also returns the raw fetched-size so size-based checks can fire.
     """
     try:
-        r = httpx.get(sitemap_url, timeout=timeout_s, follow_redirects=True,
+        r = guarded_get(sitemap_url, timeout=timeout_s, follow_redirects=True,
                       headers={"User-Agent": "LibreCrawl-MCP/1.5"})
         if r.status_code >= 400:
             return [], 0
@@ -628,7 +630,7 @@ def _fetch_robots_disallow(base_url: str, timeout_s: float = 10.0) -> list:
     parsed = urlparse(base_url)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     try:
-        r = httpx.get(robots_url, timeout=timeout_s, follow_redirects=True)
+        r = guarded_get(robots_url, timeout=timeout_s, follow_redirects=True)
         if r.status_code >= 400:
             return []
     except Exception:
@@ -735,7 +737,7 @@ async def _fetch_for_checks(url: str, client: httpx.AsyncClient,
 
 async def _fetch_all(urls: list, max_workers: int, timeout_s: float) -> list:
     sem = asyncio.Semaphore(max_workers)
-    async with httpx.AsyncClient(http2=False, verify=True) as client:
+    async with guarded_async_client(http2=False, verify=True) as client:
         async def _bounded(u):
             async with sem:
                 return await _fetch_for_checks(u, client, timeout_s)
@@ -1088,12 +1090,12 @@ def run_extended_checks(pages: list, base_url: str, output_path: Path,
     cap_applied = len(candidates) > limit
     fetch_urls = candidates[:limit]
 
-    if fetch_urls:
-        # v2.0.7: _run_coro() works whether or not an event loop is already
-        # running — fixes extended-checks vanishing from force-advanced audits.
-        results = _run_coro(
-            _fetch_all(fetch_urls, max_workers, timeout_seconds)
-        )
+    # Batched so each batch's responses become small finding rows and are
+    # freed before the next batch; all pages covered without the old OOM.
+    BATCH = 120
+    for _i in range(0, len(fetch_urls), BATCH):
+        _batch = fetch_urls[_i:_i + BATCH]
+        results = _run_coro(_fetch_all(_batch, max_workers, timeout_seconds))
 
         for url, resp, err in results:
             if err or resp is None:
@@ -1121,6 +1123,7 @@ def run_extended_checks(pages: list, base_url: str, output_path: Path,
                 else:
                     sev = "low"
                 findings.append((url, check, sev, detail))
+        results = None  # free this batch's responses before the next batch
 
     # Write CSV
     by_check = defaultdict(int)

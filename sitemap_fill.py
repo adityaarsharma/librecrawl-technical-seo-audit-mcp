@@ -32,6 +32,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from url_guard import BlockedURL, guarded_async_client
+
 
 USER_AGENT = "LibreCrawl-MCP/1.6 (Sitemap-Fill; +https://github.com/adityaarsharma/librecrawl-mcp)"
 
@@ -339,6 +341,8 @@ async def _fetch_one(url: str, client: httpx.AsyncClient,
             page["error_type"] = "dns_error"
         else:
             page["error_type"] = "connect_error"
+    except BlockedURL as e:
+        page["error_type"] = e.reason
     except httpx.UnsupportedProtocol:
         page["error_type"] = "malformed_url"
     except httpx.TransportError as e:
@@ -368,7 +372,7 @@ async def _fill_async(urls: list, max_workers: int,
     """
     sem = asyncio.Semaphore(max_workers)
     base_delay = max(0.0, delay_ms / 1000.0)
-    async with httpx.AsyncClient(http2=False, verify=True) as client:
+    async with guarded_async_client(http2=False, verify=True) as client:
         async def _bounded(u):
             async with sem:
                 if base_delay > 0:

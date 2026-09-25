@@ -24,6 +24,8 @@ from collections import defaultdict
 
 import httpx
 
+from url_guard import BlockedURL, guarded_async_client
+
 
 # URL schemes we will not validate over HTTP (not a defect, just not a webhit)
 SKIP_SCHEMES = {"mailto", "tel", "sms", "javascript", "data", "ftp", "magnet"}
@@ -229,6 +231,8 @@ async def _validate_one(target: str, client: httpx.AsyncClient,
             server = r.headers.get("server", "").strip() or None
             last_modified = r.headers.get("last-modified", "").strip() or None
 
+    except BlockedURL as e:
+        error = "blocked_private_address" if e.reason == "blocked_private_address" else e.reason
     except httpx.UnsupportedProtocol:
         error = "malformed_url"
     except httpx.InvalidURL:
@@ -265,7 +269,7 @@ async def _validate_all(targets: list[str], max_workers: int,
                          timeout_s: float) -> list[dict]:
     """Bounded-concurrency validation over the unique target list."""
     sem = asyncio.Semaphore(max_workers)
-    async with httpx.AsyncClient(http2=False, verify=True) as client:
+    async with guarded_async_client(http2=False, verify=True) as client:
         async def _bounded(t):
             async with sem:
                 return await _validate_one(t, client, timeout_s)

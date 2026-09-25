@@ -18,6 +18,8 @@ from urllib.parse import urlparse, unquote
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+from url_guard import BlockedURL, check_url, guarded_get, preflight
+
 # v2.0.3 — server instructions are surfaced to the LLM at connection time by
 # every MCP-compatible client. This means the rules below apply even when the
 # operator does NOT have the local Claude Code skill installed — any client
@@ -37,34 +39,42 @@ these rules before invoking any tool. They are MANDATORY.
    → poll every 20-30 seconds until status="done". Safe to poll often,
    it reads local SQLite, no upstream calls.
 
-3. librecrawl_audit_zip(session_id, auto_cleanup=True)
-   → ALWAYS auto_cleanup=True. This is the default and the only sane
-   choice. The server wipes the session + artifacts + upstream record
-   the moment this call returns.
+3. librecrawl_audit_zip(session_id)
+   → returns the zip as `content_base64` plus its `sha256`. The server
+   keeps its copy until you confirm, so a failed save loses nothing.
+
+4. Save the zip locally, then call
+   librecrawl_audit_confirm_saved(session_id, sha256=<sha256 of the file you wrote>)
+   → the server checks the hash against its own copy and only then wipes
+   the session, the artifacts, the zip and the upstream crawl record.
+   A mismatch deletes nothing. Unconfirmed zips are swept after 1 hour.
 
 # MANDATORY rules for handling the zip response
 
 Rule 1 — SAVE THE ZIP LOCALLY, IMMEDIATELY.
-The response includes `content_base64`. You MUST base64-decode it and
-write the bytes to a LOCAL file on the operator's machine. Use the
-response's `filename` field as the local filename. Pseudo-code your
-runtime must execute right after receiving the response:
+base64-decode `content_base64` and write the bytes to a LOCAL file on the
+operator's machine, named by the response's `filename` field:
 
-    import base64
-    local_path = response["filename"]
-    with open(local_path, "wb") as f:
-        f.write(base64.b64decode(response["content_base64"]))
+    import base64, hashlib
+    data = base64.b64decode(response["content_base64"])
+    with open(response["filename"], "wb") as f:
+        f.write(data)
+    local_sha = hashlib.sha256(data).hexdigest()
 
 Rule 2 — NEVER report `zip_path` as the deliverable.
-The `zip_path` field in the response is on the REMOTE server. The
-operator cannot open it. It's there for forensics only. Report ONLY
-the LOCAL path you just saved to in your reply to the user.
+`zip_path` is on the REMOTE server; the operator cannot open it. Report
+ONLY the local path you saved to.
 
-Rule 3 — auto_cleanup=True is mandatory.
-The server is ephemeral by design. Do not set auto_cleanup=False to
-"preserve data" — the base64 zip you just received IS the preserved
-data. Skipping auto_cleanup leaves audit data on the server, which
-violates the operator's stated privacy contract.
+Rule 3 — ALWAYS confirm.
+Call librecrawl_audit_confirm_saved with the hash of the bytes you wrote,
+not the hash the server sent you. Report the cleanup result: `success`
+is True only when every cleanup step passed. If it is False, say which
+step failed (the `cleanup` field lists them) rather than claiming the
+server forgot everything.
+
+auto_cleanup=True on librecrawl_audit_zip is still available for clients
+that cannot write files back and confirm: it wipes in the same call, so a
+failed local save then loses the audit.
 
 # What the audit produces
 
@@ -84,10 +94,10 @@ titles, and dedicated H2 sections for redirects, hreflang, schema, etc.
 
 # Final response shape to the user
 
-✅ Audit complete.
-Saved locally: ./<domain>-<ts>.zip (XXX KB · sha256 verified)
-Contents: PDF report + 7 CSVs.
-Server forgot the session — nothing remote.
+Audit complete.
+Saved locally: ./<domain>-<session>.zip (XXX KB, sha256 verified by the server)
+Contents: PDF report + CSVs (list any `missing` files).
+Server cleanup: <passed | failed at step X>.
 """
 
 mcp = FastMCP("librecrawl-mcp", instructions=LIBRECRAWL_MCP_INSTRUCTIONS)
@@ -104,7 +114,7 @@ EXPORT_FIELDS = [
     # Core
     "url", "status_code", "title", "meta_description", "h1",
     "word_count", "canonical_url", "depth", "issues_detected",
-    "response_time_ms",
+    "response_time",          # upstream name, already in ms; mapped to response_time_ms
     # Headings
     "h2", "h3",
     # Links
@@ -120,6 +130,93 @@ EXPORT_FIELDS = [
 ]
 
 def _parse_export(export) -> tuple:
+    """Parse an upstream export and normalise field names (see _normalise_page)."""
+    pages, links = _parse_export_raw(export)
+    return [_normalise_page(p) for p in pages], links
+
+
+def _normalise_page(p):
+    """Upstream exports `response_time` (ms). Every consumer here reads
+    `response_time_ms`, which upstream never sends, so latency was always 0."""
+    if isinstance(p, dict) and not p.get("response_time_ms") and p.get("response_time") is not None:
+        try:
+            p["response_time_ms"] = round(float(p["response_time"]))
+        except (TypeError, ValueError):
+            pass
+    return p
+
+
+def _host_variants(url: str) -> set:
+    host = (urlparse(url or "").hostname or "").lower()
+    if not host:
+        return set()
+    bare = host[4:] if host.startswith("www.") else host
+    return {bare, "www." + bare}
+
+
+def _is_seed_page(p: dict, seed_url: str = "") -> bool:
+    """The crawl's start page. It has no inbound links by definition, so it is never an orphan."""
+    if not isinstance(p, dict):
+        return False
+    if p.get("source") != "sitemap_fill":
+        try:
+            if int(p.get("depth") or 0) == 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    if seed_url:
+        return (p.get("url") or "").rstrip("/") == seed_url.rstrip("/")
+    return False
+
+
+def _site_hosts(seed_url: str, pages: list = None) -> set:
+    """Hosts that count as this site: the seed, its www twin, and wherever the
+    seed redirected to (the depth-0 page)."""
+    hosts = _host_variants(seed_url)
+    for p in pages or []:
+        if _is_seed_page(p):
+            hosts |= _host_variants(p.get("url", ""))
+    return hosts
+
+
+def _on_site(url: str, hosts: set) -> bool:
+    return (urlparse(url or "").hostname or "").lower() in hosts
+
+
+def _is_orphan(p: dict, seed_url: str = "") -> bool:
+    return not (p.get("linked_from") or []) and not _is_seed_page(p, seed_url)
+
+
+def _crawl_base_url(crawl_id, pages: list = None) -> str:
+    """The URL a crawl was started from: upstream crawl metadata first, then the
+    depth-0 page. Never 'the first page in the export', which can be any page."""
+    try:
+        r = _upstream_request("GET", "/api/crawls/list", params={"limit": 200, "offset": 0}, timeout=30)
+        for c in (r.json() or {}).get("crawls", []) if r.status_code == 200 else []:
+            if str(c.get("id")) == str(crawl_id) and c.get("base_url"):
+                return c["base_url"]
+    except Exception:
+        pass
+    for p in pages or []:
+        if _is_seed_page(p):
+            return p.get("url", "")
+    return (pages[0].get("url", "") if pages else "")
+
+
+def _seed_gate(url: str) -> dict | None:
+    """Validate + preflight a crawl seed. Returns an error dict, or None when fine."""
+    try:
+        check_url(url)
+    except BlockedURL as e:
+        return {"success": False, "error": str(e), "reason": e.reason}
+    pf = preflight(url.strip())
+    if not pf.get("ok"):
+        return {"success": False, "error": f"Seed URL unreachable: {pf.get('error')}",
+                "reason": pf.get("reason", "unreachable")}
+    return None
+
+
+def _parse_export_raw(export) -> tuple:
     """
     Parse LibreCrawl export response into (pages, links).
     Handles three response formats LibreCrawl uses depending on version:
@@ -276,9 +373,21 @@ def _site_check(base_url: str) -> dict:
     root     = f"{scheme}://{host}"
     results  = {}
 
+    # Refuse non-http(s) / private targets, and stop early when the host is
+    # unreachable, instead of reporting "no sitemap, submit one to GSC" for a
+    # domain that does not resolve.
+    try:
+        check_url(root + "/")
+    except BlockedURL as e:
+        return {"reachable": False, "error": str(e), "reason": e.reason}
+    pf = preflight(root + "/", timeout=15)
+    if not pf["ok"]:
+        return {"reachable": False, "error": pf["error"], "reason": pf["reason"]}
+    results["reachable"] = True
+
     # ── robots.txt ────────────────────────────────────────────────────────────
     try:
-        r = httpx.get(f"{root}/robots.txt", timeout=10, follow_redirects=True)
+        r = guarded_get(f"{root}/robots.txt", timeout=10, follow_redirects=True)
         if r.status_code == 200:
             txt      = r.text
             lines    = txt.splitlines()
@@ -316,7 +425,7 @@ def _site_check(base_url: str) -> dict:
     sitemap_found = False
     for sm_url in sitemap_urls_to_try:
         try:
-            r = httpx.get(sm_url, timeout=15, follow_redirects=True)
+            r = guarded_get(sm_url, timeout=15, follow_redirects=True)
             if r.status_code == 200 and ("<urlset" in r.text or "<sitemapindex" in r.text):
                 url_count = r.text.count("<loc>")
                 is_index  = "<sitemapindex" in r.text
@@ -342,7 +451,7 @@ def _site_check(base_url: str) -> dict:
     if scheme == "https":
         try:
             http_url = f"http://{host}/"
-            r = httpx.get(http_url, timeout=10, follow_redirects=False)
+            r = guarded_get(http_url, timeout=10, follow_redirects=False)
             if r.status_code in (301, 302, 307, 308):
                 loc = r.headers.get("location", "")
                 results["https_redirect"] = {
@@ -363,7 +472,7 @@ def _site_check(base_url: str) -> dict:
     try:
         is_www = host.startswith("www.")
         alt_host = host[4:] if is_www else f"www.{host}"
-        r = httpx.get(f"{scheme}://{alt_host}/", timeout=10, follow_redirects=False)
+        r = guarded_get(f"{scheme}://{alt_host}/", timeout=10, follow_redirects=False)
         redirects_to_canonical = r.status_code in (301, 302, 307, 308)
         results["www_redirect"] = {
             "canonical_host": host,
@@ -489,7 +598,6 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
         page_size   = p.get("size") or 0
         images      = p.get("images") or []
         b_images    = p.get("broken_images") or []
-        linked_from = p.get("linked_from") or []
         redirects_chain = p.get("redirects") or []
         og_tags     = p.get("og_tags") or {}
         viewport    = (p.get("viewport") or "").strip()
@@ -557,7 +665,7 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
             # uniformly — sitemap_fill pages extract their in-content <a href>
             # links so the inbound graph reaches them just like LibreCrawl-
             # crawled pages. The earlier v1.6.1 exclusion is no longer needed.
-            if not linked_from:
+            if _is_orphan(p, base_url):
                 orphan_pages.append(url)
 
             # Redirect chain (page itself underwent >1 redirect to get here)
@@ -609,7 +717,8 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
         if canonical in broken_urls:
             bad_canonical.append((url, canonical))
 
-    broken   = status_buckets.get("4xx", []) + status_buckets.get("5xx", [])
+    # Status 0 means no HTTP response at all (DNS, refused, timeout): that is broken too.
+    broken   = status_buckets.get("4xx", []) + status_buckets.get("5xx", []) + status_buckets.get("0xx", [])
     redirect = status_buckets.get("3xx", [])
     ok       = status_buckets.get("2xx", [])
 
@@ -1261,7 +1370,8 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
         depth  = p.get("depth", "?")
         canonical = (p.get("canonical_url") or "").strip()
         canon_icon = "✅" if canonical == url else ("—" if not canonical else "↪️")
-        status_icon = "🔴" if str(status).startswith(("4","5")) else "↪️" if str(status).startswith("3") else "✅"
+        status_icon = ("🔴" if str(status).startswith(("4","5")) else "↪️" if str(status).startswith("3")
+                       else "✅" if str(status).startswith("2") else "⚠️")
         lines.append(f"| {status_icon} {status} | {depth} | `{url}` | {title} | {words} | {canon_icon} |")
 
     if len(pages) > 300:
@@ -1422,7 +1532,7 @@ def _build_checks_manifest(pages: list, site_data: dict, links: list) -> dict:
             no_alt = sum(1 for i in imgs if isinstance(i, dict) and not (i.get("alt") or "").strip())
             if no_alt: fails["missing_alt_pages"] += 1
         if isinstance(bimg, list) and bimg: fails["broken_img_pages"] += 1
-        if not lkfrm:
+        if not lkfrm and not _is_seed_page(p):
             fails["orphan_pages"] += 1
         if isinstance(rdr, list) and len(rdr) > 1: fails["redirect_chains"] += 1
         og_t = og.get("og:title") or og.get("title") or ""
@@ -1522,8 +1632,8 @@ def _fetch_sitemap_urls(sitemap_url: str, _depth: int = 0) -> tuple:
         return [], [f"sitemap-index recursion >3 levels at {sitemap_url}"]
     out, errors = [], []
     try:
-        r = httpx.get(sitemap_url, timeout=20, follow_redirects=True,
-                      headers={"User-Agent": "librecrawl-mcp/sitemap-recon"})
+        r = guarded_get(sitemap_url, timeout=20, follow_redirects=True,
+                        headers={"User-Agent": "librecrawl-mcp/sitemap-recon"})
         if r.status_code >= 400:
             errors.append(f"{sitemap_url} → HTTP {r.status_code}")
             return [], errors
@@ -1556,7 +1666,9 @@ def _compute_sitemap_reconciliation(crawl_pages: list, sitemap_url: str) -> dict
       sitemap_total / crawl_total / sitemap_fetch_errors
     """
     sm_urls, errors = _fetch_sitemap_urls(sitemap_url)
-    sm_set    = set(u.rstrip("/") for u in sm_urls if u)
+    _hosts    = _host_variants(sitemap_url) | _site_hosts("", crawl_pages)
+    sm_all    = set(u.rstrip("/") for u in sm_urls if u)
+    sm_set    = {u for u in sm_all if _on_site(u, _hosts)}
     crawled   = {(p.get("url") or "").rstrip("/"): p for p in crawl_pages if p.get("url")}
     crawl_set = set(crawled.keys())
 
@@ -1582,6 +1694,7 @@ def _compute_sitemap_reconciliation(crawl_pages: list, sitemap_url: str) -> dict
         "sitemap_only":             sitemap_only,
         "crawl_only":               crawl_only,
         "sitemap_fetch_errors":     errors,
+        "sitemap_offsite_count":    len(sm_all - sm_set),
     }
 
 
@@ -1602,7 +1715,7 @@ _PER_PAGE_CHECKS = [
     ("noindex",             lambda p: "noindex" in (p.get("robots") or "").lower()),
     ("large_page_500kb",    lambda p: (p.get("size") or 0) > 500_000),
     ("missing_viewport",    lambda p: not (p.get("viewport") or "").strip() and str(p.get("status_code","")).startswith("2")),
-    ("orphan_page",         lambda p: not (p.get("linked_from") or []) and str(p.get("status_code","")).startswith("2")),
+    ("orphan_page",         lambda p: _is_orphan(p) and str(p.get("status_code","")).startswith("2")),
     ("redirect_chain",      lambda p: isinstance(p.get("redirects"), list) and len(p.get("redirects") or []) > 1),
     ("status_4xx",          lambda p: str(p.get("status_code","")).startswith("4")),
     ("status_5xx",          lambda p: str(p.get("status_code","")).startswith("5")),
@@ -1677,7 +1790,7 @@ def _write_sitemap_recon_csv(recon: dict, output_path: "Path") -> dict:
 # ── MCP Tools ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def librecrawl_audit(url: str, max_pages: int = 0) -> dict:
+def librecrawl_audit(url: str, max_pages: int = 500, confirm_unbounded: bool = False) -> dict:
     """
     Full SEO / technical site audit in one call — the Screaming Frog alternative.
 
@@ -1694,9 +1807,17 @@ def librecrawl_audit(url: str, max_pages: int = 0) -> dict:
 
     Args:
         url:       Full URL to crawl (e.g. https://example.com)
-        max_pages: Max pages to crawl. 0 = unlimited (default). Set e.g. 500 to
-                   cap a large site. Crawls up to 2 hours before timing out.
+        max_pages: Max pages to crawl. Default 500. 0 = unlimited, which also
+                   needs confirm_unbounded=True. Crawls up to 2 hours before timing out.
+        confirm_unbounded: Required with max_pages=0.
     """
+    if max_pages <= 0 and not confirm_unbounded:
+        return {"success": False, "reason": "unbounded_needs_confirm",
+                "error": "max_pages=0 (unlimited) requires confirm_unbounded=True."}
+    gate = _seed_gate(url)
+    if gate:
+        return gate
+    url = url.strip()
     started_at = time.time()
     # Reset any stale crawler state so this run starts clean
     reset_info = _ensure_crawler_ready()
@@ -1709,8 +1830,8 @@ def librecrawl_audit(url: str, max_pages: int = 0) -> dict:
         "followRedirects": True,
         "crawlExternalLinks": False,
     }
-    if max_pages > 0:
-        settings["maxUrls"] = max_pages
+    # Always set maxUrls: leaving it out keeps whatever the previous run saved.
+    settings["maxUrls"] = max_pages if max_pages > 0 else 5_000_000
     call("POST", "/api/save_settings", json=settings)
     result   = call("POST", "/api/start_crawl", json={"url": url})
     crawl_id = result.get("crawl_id")
@@ -1912,12 +2033,11 @@ def librecrawl_generate_report(crawl_id: int = None) -> dict:
         return {"success": False, "error": "No pages found. Is the crawl complete?"}
 
     if not base_url and pages:
-        parsed   = urlparse(pages[0].get("url", ""))
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        base_url = _crawl_base_url(crawl_id, pages)
 
     report_md   = _build_report(pages, base_url, crawl_id or 0, links=links)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    domain      = base_url.replace("https://","").replace("http://","").rstrip("/").split("/")[0]
+    domain      = _safe_domain(base_url)
     timestamp   = datetime.now().strftime("%Y%m%d-%H%M")
     report_path = REPORTS_DIR / f"{domain}-{timestamp}.md"
     report_path.write_text(report_md, encoding="utf-8")
@@ -1940,7 +2060,7 @@ def librecrawl_generate_report(crawl_id: int = None) -> dict:
 
 
 @mcp.tool()
-def librecrawl_start_crawl(url: str, max_pages: int = 0) -> dict:
+def librecrawl_start_crawl(url: str, max_pages: int = 500, confirm_unbounded: bool = False) -> dict:
     """
     Start an async site crawl. Returns crawl_id immediately — does NOT wait for completion.
     Poll librecrawl_get_status() until done, then librecrawl_generate_report(crawl_id).
@@ -1950,8 +2070,17 @@ def librecrawl_start_crawl(url: str, max_pages: int = 0) -> dict:
 
     Args:
         url:       Full URL to crawl (e.g. https://example.com)
-        max_pages: Max pages to crawl. 0 = unlimited (default). Set e.g. 500 to cap.
+        max_pages: Max pages to crawl. Default 500. 0 = unlimited, which also
+                   needs confirm_unbounded=True.
+        confirm_unbounded: Required with max_pages=0.
     """
+    if max_pages <= 0 and not confirm_unbounded:
+        return {"success": False, "reason": "unbounded_needs_confirm",
+                "error": "max_pages=0 (unlimited) requires confirm_unbounded=True."}
+    gate = _seed_gate(url)
+    if gate:
+        return gate
+    url = url.strip()
     settings = {
         "enableJavaScript": False,
         "maxDepth": 5,
@@ -1959,8 +2088,8 @@ def librecrawl_start_crawl(url: str, max_pages: int = 0) -> dict:
         "followRedirects": True,
         "crawlExternalLinks": False,
     }
-    if max_pages > 0:
-        settings["maxUrls"] = max_pages
+    # Always set maxUrls: leaving it out keeps whatever the previous run saved.
+    settings["maxUrls"] = max_pages if max_pages > 0 else 5_000_000
     _ensure_crawler_ready()
     call("POST", "/api/save_settings", json=settings)
     result   = call("POST", "/api/start_crawl", json={"url": url})
@@ -1981,11 +2110,13 @@ def librecrawl_get_status() -> dict:
     """
     d     = call("GET", "/api/crawl_status")
     stats = d.get("stats", {})
+    # Upstream sends the issue list at the top level, not a count in stats.
+    issues = d.get("issues")
     return {
         "is_running": d.get("is_running", False),
         "crawled":    stats.get("crawled", 0),
         "queued":     stats.get("queued", 0),
-        "issues":     stats.get("issues", 0),
+        "issues":     len(issues) if isinstance(issues, list) else stats.get("issues", 0),
         "base_url":   stats.get("baseUrl", ""),
     }
 
@@ -2118,9 +2249,17 @@ def librecrawl_resume_from_crawl_id(crawl_id: int) -> dict:
 def librecrawl_get_settings() -> dict:
     """
     Get current crawler settings (maxUrls, maxDepth, crawlDelay, JS rendering, etc).
-    Useful to confirm settings before starting a crawl.
+    Useful to confirm settings before starting a crawl. Returns the handful of
+    settings that shape a crawl up top, the full dict under `settings`.
     """
-    return call("GET", "/api/get_settings")
+    d = call("GET", "/api/get_settings")
+    st = d.get("settings") or {}
+    keys = ("maxUrls", "maxDepth", "crawlDelay", "enableJavaScript", "followRedirects",
+            "crawlExternalLinks", "respectRobotsTxt", "userAgent", "concurrency")
+    return {"success": d.get("success", bool(st)),
+            "summary": {k: st[k] for k in keys if k in st},
+            "settings": st,
+            **({"error": d["error"]} if d.get("error") else {})}
 
 
 @mcp.tool()
@@ -2132,11 +2271,19 @@ def librecrawl_filter_issues(patterns: list) -> dict:
     Args:
         patterns: List of strings to exclude (e.g. ["/wp-admin/", "cdn.example.com"])
     """
+    # Upstream /api/filter_issues ignores caller patterns (it only applies its
+    # saved settings to an {"issues": [...]} body), so filter here instead.
+    pats = [str(x).strip().lower() for x in (patterns or []) if str(x).strip()]
     try:
-        return call("POST", "/api/filter_issues", json={"patterns": patterns})
+        issues = call("GET", "/api/crawl_status").get("issues") or []
     except Exception as e:
-        return {"success": False, "error": str(e),
-                "note": "This endpoint may not be available in your LibreCrawl version."}
+        return {"success": False, "error": str(e)}
+    def _hit(i):
+        hay = " ".join(str(i.get(k, "")) for k in ("url", "type", "category", "issue", "details")).lower()
+        return any(p_ in hay for p_ in pats)
+    kept = [i for i in issues if isinstance(i, dict) and not _hit(i)]
+    return {"success": True, "total": len(issues), "excluded": len(issues) - len(kept),
+            "kept": len(kept), "issues": kept[:500], "truncated": len(kept) > 500}
 
 
 @mcp.tool()
@@ -2243,7 +2390,7 @@ def librecrawl_internal_links_analysis(crawl_id: int = None) -> dict:
     # Pages with zero inbound links (no internal authority — orphans)
     orphans = [
         p.get("url") for p in ok_pages
-        if inbound_count.get(p.get("url",""), 0) == 0
+        if inbound_count.get(p.get("url",""), 0) == 0 and not _is_seed_page(p)
     ]
 
     # Top anchors
@@ -2286,12 +2433,16 @@ def librecrawl_internal_links_analysis(crawl_id: int = None) -> dict:
 
 def _fetch_psi(url: str, strategy: str = "mobile") -> dict:
     """Fetch Core Web Vitals + performance score from Google PSI API."""
-    if not PSI_API_KEY:
-        return {"error": "PAGESPEED_API_KEY not set."}
-    params = {"url": url, "key": PSI_API_KEY, "strategy": strategy,
+    # PSI works without a key at a low shared quota; a key only raises the limit.
+    params = {"url": url, "strategy": strategy,
               "category": ["performance", "seo", "accessibility", "best-practices"]}
+    if PSI_API_KEY:
+        params["key"] = PSI_API_KEY
     try:
-        r = httpx.get(PSI_API_BASE, params=params, timeout=30)
+        r = httpx.get(PSI_API_BASE, params=params, timeout=60)
+        if r.status_code == 429:
+            return {"url": url, "error": "PSI rate limit hit (429). Set PAGESPEED_API_KEY for a higher quota.",
+                    "reason": "rate_limited", "keyless": not PSI_API_KEY}
         r.raise_for_status()
         data = r.json()
     except Exception as e:
@@ -2379,9 +2530,6 @@ def librecrawl_pagespeed_audit(urls: list, strategy: str = "mobile") -> dict:
         urls:     List of URLs to test (recommend top 10–25 pages)
         strategy: "mobile" (default) or "desktop"
     """
-    if not PSI_API_KEY:
-        return {"error": "PAGESPEED_API_KEY not set."}
-
     results = []
     for url in urls[:25]:
         results.append(_fetch_psi(url, strategy))
@@ -2448,25 +2596,11 @@ class _JsonLdExtractor(HTMLParser):
 
 
 def _validate_public_url(url: str) -> str | None:
-    """Return error string if URL is unsafe, else None."""
-    import ipaddress
+    """Return error string if URL is unsafe, else None. Thin wrapper over url_guard."""
     try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return f"URL scheme must be http or https, got: {parsed.scheme!r}"
-        host = parsed.hostname or ""
-        # Block private/loopback/link-local addresses
-        try:
-            addr = ipaddress.ip_address(host)
-            if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-                return f"Private/internal IP not allowed: {host}"
-        except ValueError:
-            # It's a hostname — block obvious internal names
-            blocked = ("localhost", "metadata.google.internal")
-            if any(host == b or host.endswith("." + b) for b in blocked):
-                return f"Internal hostname not allowed: {host}"
-    except Exception as e:
-        return f"Invalid URL: {e}"
+        check_url(url)
+    except BlockedURL as e:
+        return str(e)
     return None
 
 
@@ -2475,8 +2609,8 @@ def _extract_schema(url: str) -> list:
     if err:
         return [{"error": err}]
     try:
-        r = httpx.get(url, follow_redirects=True, timeout=15,
-                      headers={"User-Agent": "Mozilla/5.0 (compatible; SEO-bot/1.0)"})
+        r = guarded_get(url, follow_redirects=True, timeout=15,
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; SEO-bot/1.0)"})
         parser = _JsonLdExtractor()
         parser.feed(r.text)
         return parser.schemas
@@ -2523,7 +2657,11 @@ def librecrawl_schema_check(url: str) -> dict:
     Args:
         url: Full URL to check
     """
-    schemas = _extract_schema(url)
+    extracted = _extract_schema(url)
+    errors  = [s["error"] for s in extracted if "error" in s]
+    schemas = [s for s in extracted if "error" not in s]
+    if errors and not schemas:
+        return {"success": False, "url": url, "error": errors[0], "schema_count": 0}
     found_types = [s.get("type") for s in schemas if "type" in s]
     return {
         "url": url,
@@ -2565,14 +2703,22 @@ def librecrawl_schema_audit(urls: list, batch_size: int = 50, batch_delay: float
     type_count = defaultdict(int)
     total      = len(urls)
 
+    fetch_errors = []
     for i, url in enumerate(urls):
-        schemas = _extract_schema(url)
-        types   = [s.get("type") for s in schemas if "type" in s]
-        for t in types:
-            type_count[t] += 1
-        if not types:
-            no_schema.append(url)
-        results.append({"url": url, "types": types, "count": len(schemas)})
+        raw     = _extract_schema(url)
+        errs    = [s["error"] for s in raw if isinstance(s, dict) and "error" in s]
+        schemas = [s for s in raw if not (isinstance(s, dict) and "error" in s)]
+        if errs and not schemas:
+            # A page we could not fetch is not a page "without schema".
+            fetch_errors.append({"url": url, "error": errs[0]})
+            results.append({"url": url, "types": [], "count": 0, "error": errs[0]})
+        else:
+            types = [s.get("type") for s in schemas if "type" in s]
+            for t in types:
+                type_count[t] += 1
+            if not types:
+                no_schema.append(url)
+            results.append({"url": url, "types": types, "count": len(schemas)})
         if i < total - 1:
             time.sleep(batch_delay)
 
@@ -2581,9 +2727,10 @@ def librecrawl_schema_audit(urls: list, batch_size: int = 50, batch_delay: float
         "pages_no_schema":       len(no_schema),
         "schema_type_breakdown": dict(sorted(type_count.items(), key=lambda x: -x[1])),
         "pages_missing_schema":  no_schema,
+        "fetch_errors":          fetch_errors,
         "results": results,
         "batch_caps_hit":        False,
-        "audit_complete":        len(results) == total,
+        "audit_complete":        len(results) == total and not fetch_errors,
     }
 
 
@@ -2658,14 +2805,10 @@ def librecrawl_schema_validate(crawl_id: int) -> dict:
     summary = schema_validator.validate_crawl_schemas(pages)
 
     # Derive domain + timestamp
-    base_url = ""
-    for p in pages:
-        u = p.get("url") or ""
-        if u:
-            pp = urlparse(u)
-            base_url = f"{pp.scheme}://{pp.netloc}"
-            break
-    domain = base_url.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0] or "unknown"
+    _seed = _crawl_base_url(crawl_id, pages)
+    _sp = urlparse(_seed)
+    base_url = f"{_sp.scheme}://{_sp.netloc}" if _sp.netloc else ""
+    domain = _safe_domain(base_url)
     ts = datetime.now().strftime("%Y%m%d-%H%M")
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     csv_path = REPORTS_DIR / f"{domain}-{ts}.schema-validation.csv"
@@ -2717,7 +2860,7 @@ def librecrawl_append_gsc_section(report_path: str, gsc_data: dict) -> dict:
         gsc_data:    GSC data dict from the gsc-posi connector
     """
     path = Path(report_path).resolve()
-    if not str(path).startswith(str(REPORTS_DIR.resolve())):
+    if not path.is_relative_to(REPORTS_DIR.resolve()):
         return {"success": False, "error": "report_path must be within REPORTS_DIR"}
     if not path.exists():
         return {"success": False, "error": f"Report not found: {report_path}"}
@@ -2961,17 +3104,13 @@ def librecrawl_merge_gsc_data(crawl_id: int, gsc_data: dict) -> dict:
         }
 
     # Derive domain + timestamp from the first crawled URL
-    base_url = ""
-    for p in pages:
-        u = (p.get("url") or "").strip()
-        if u:
-            pp = urlparse(u)
-            base_url = f"{pp.scheme}://{pp.netloc}"
-            break
+    _seed = _crawl_base_url(crawl_id, pages)
+    _sp = urlparse(_seed)
+    base_url = f"{_sp.scheme}://{_sp.netloc}" if _sp.netloc else ""
     if not base_url:
         return {"success": False, "error": "Cannot determine base URL from crawl"}
 
-    domain = base_url.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
+    domain = _safe_domain(base_url)
     ts = datetime.now().strftime("%Y%m%d-%H%M")
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -3300,9 +3439,23 @@ def librecrawl_audit_force_advance(session_id: str) -> dict:
 
 # ── v1.2.0 Screaming-Frog parity tools ────────────────────────────────────────
 
+def _sitemap_errors(result: dict) -> list:
+    return list((result.get("sitemap_reconciliation") or {}).get("sitemap_fetch_errors") or [])
+
+
+def _sitemap_missing(result: dict) -> bool:
+    """True when the only sitemap error is the root sitemap answering 404/410."""
+    errs = _sitemap_errors(result)
+    return bool(errs) and all(re.search(r"HTTP (404|410)$", e or "") for e in errs)
+
+
+def _sitemap_fetch_failed(result: dict) -> bool:
+    return bool(_sitemap_errors(result)) and not _sitemap_missing(result)
+
+
 @mcp.tool()
-def librecrawl_full_audit_strict(url: str, max_pages: int = 0, auto_purge: bool = True,
-                                  keep_for_days: int = 0) -> dict:
+def librecrawl_full_audit_strict(url: str, max_pages: int = 500, auto_purge: bool = True,
+                                  keep_for_days: int = 0, confirm_unbounded: bool = False) -> dict:
     """
     STRICT-MODE site audit — Screaming Frog parity. Same as librecrawl_audit
     but the response is annotated with an audit_complete flag and the run is
@@ -3323,13 +3476,13 @@ def librecrawl_full_audit_strict(url: str, max_pages: int = 0, auto_purge: bool 
 
     Args:
         url:           Full URL to crawl.
-        max_pages:     Hard ceiling on pages. 0 = unlimited (default — recommended).
+        max_pages:     Hard ceiling on pages. Default 500. 0 = unlimited, needs confirm_unbounded=True.
         auto_purge:    If True (default), the upstream crawl record is deleted
                        from the LibreCrawl DB once the report is written. Set
                        False (or keep_for_days>0) to retain it for re-export.
         keep_for_days: Retention override. >0 disables auto_purge.
     """
-    result = librecrawl_audit(url=url, max_pages=max_pages)
+    result = librecrawl_audit(url=url, max_pages=max_pages, confirm_unbounded=confirm_unbounded)
     if not result.get("success"):
         result["strict_mode"] = True
         result["audit_complete"] = False
@@ -3343,7 +3496,7 @@ def librecrawl_full_audit_strict(url: str, max_pages: int = 0, auto_purge: bool 
         and not completeness.get("max_pages_hit")
         and not completeness.get("batch_caps_hit")
         and (result.get("per_page_csv") or {}).get("rows", 0) > 0
-        and not (result.get("sitemap_reconciliation") or {}).get("sitemap_fetch_errors")
+        and not _sitemap_fetch_failed(result)
     )
     result["strict_mode"]    = True
     result["audit_complete"] = strict_ok
@@ -3354,14 +3507,19 @@ def librecrawl_full_audit_strict(url: str, max_pages: int = 0, auto_purge: bool 
             "max_pages_hit":        completeness.get("max_pages_hit"),
             "batch_caps_hit":       completeness.get("batch_caps_hit"),
             "per_page_csv_empty":   (result.get("per_page_csv") or {}).get("rows", 0) == 0,
-            "sitemap_fetch_errors": bool((result.get("sitemap_reconciliation") or {}).get("sitemap_fetch_errors")),
+            "sitemap_fetch_errors": _sitemap_fetch_failed(result),
         }.items() if v
     ]
+    if _sitemap_missing(result):
+        result.setdefault("findings", []).append(
+            "sitemap_missing: no XML sitemap at the expected location (a finding, not a crawl failure)")
 
     # Auto-purge the upstream crawl record now that the report + sidecars are on disk.
     # Default-on. Override with keep_for_days>0 or
     # auto_purge=False to retain the upstream DB record for re-export.
-    if auto_purge and keep_for_days <= 0 and result.get("crawl_id") and strict_ok:
+    # The report and sidecars are on disk whether or not the audit was complete,
+    # so the upstream copy is purged either way (privacy contract).
+    if auto_purge and keep_for_days <= 0 and result.get("crawl_id"):
         try:
             purge = librecrawl_brain_purge_audit(crawl_id=result["crawl_id"])
             result["brain_purge"] = purge
@@ -3369,7 +3527,7 @@ def librecrawl_full_audit_strict(url: str, max_pages: int = 0, auto_purge: bool 
             result["brain_purge"] = {"success": False, "error": str(e)}
     else:
         result["brain_purge"] = {"success": False, "skipped": True,
-                                  "reason": "auto_purge=False or keep_for_days>0 or audit incomplete"}
+                                  "reason": "auto_purge=False or keep_for_days>0"}
 
     return result
 
@@ -3390,7 +3548,7 @@ def librecrawl_report_content(report_path: str, max_chars: int = 200_000) -> dic
                      this is truncated; set higher only if your client can handle it.
     """
     p = Path(report_path).resolve()
-    if not str(p).startswith(str(REPORTS_DIR.resolve())):
+    if not p.is_relative_to(REPORTS_DIR.resolve()):
         return {"success": False, "error": f"Path must be within REPORTS_DIR ({REPORTS_DIR})"}
     if not p.exists():
         return {"success": False, "error": f"File not found: {report_path}"}
@@ -3432,7 +3590,7 @@ def librecrawl_audit_pdf(report_path: str, base_url: str = "") -> dict:
     """
     import pdf_report
     p = Path(report_path).resolve()
-    if not str(p).startswith(str(REPORTS_DIR.resolve())):
+    if not p.is_relative_to(REPORTS_DIR.resolve()):
         return {"success": False, "error": f"Path must be within REPORTS_DIR ({REPORTS_DIR})"}
     if not p.exists():
         return {"success": False, "error": f"File not found: {report_path}"}
@@ -3483,9 +3641,6 @@ def librecrawl_pagespeed_audit_all_crawl_pages(crawl_id: int, strategy: str = "m
                        If limit > 0 and the crawl has more, batch_caps_hit=True.
         delay_seconds: Sleep between PSI calls. Default 1.0 (under PSI rate limit).
     """
-    if not PSI_API_KEY:
-        return {"success": False, "error": "PAGESPEED_API_KEY not set in environment."}
-
     # Load the crawl and export
     try:
         call("POST", f"/api/crawls/{crawl_id}/load")
@@ -3585,15 +3740,11 @@ def librecrawl_external_links_audit(crawl_id: int, max_workers: int = 10,
     if not pages:
         return {"success": False, "error": "Crawl has no pages exported."}
 
-    base_url = ""
-    for p in pages:
-        u = p.get("url") or ""
-        if u:
-            parsed = urlparse(u)
-            base_url = f"{parsed.scheme}://{parsed.netloc}"
-            break
+    _seed = _crawl_base_url(crawl_id, pages)
+    _sp = urlparse(_seed)
+    base_url = f"{_sp.scheme}://{_sp.netloc}" if _sp.netloc else ""
 
-    domain = base_url.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
+    domain = _safe_domain(base_url)
     ts = datetime.now().strftime("%Y%m%d-%H%M")
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = REPORTS_DIR / f"{domain}-{ts}.external-links.csv"
@@ -3615,60 +3766,60 @@ def librecrawl_brain_purge_audit(crawl_id: int) -> dict:
     The Markdown report and sidecar CSV files in REPORTS_DIR are NOT touched —
     they live on disk independently of the DB record.
 
+    `success` is True only when the crawl record is actually gone.
+
     Args:
         crawl_id: ID returned by librecrawl_audit / start_crawl / list_crawls.
     """
-    # Try the canonical REST delete first. If upstream LibreCrawl doesn't
-    # expose it, fall back to /api/clear_data (clears the active in-memory
-    # crawler, leaving the DB record but freeing memory).
-    try:
-        r = get_client().delete(f"{BASE}/api/crawls/{crawl_id}", timeout=30)
-        if r.status_code in (200, 204):
-            return {"success": True, "crawl_id": crawl_id, "method": "delete_endpoint"}
-        # 404/405 — fall through
-    except Exception:
-        pass
-
-    try:
-        result = call("POST", "/api/clear_data")
-        return {
-            "success":  True,
-            "crawl_id": crawl_id,
-            "method":   "clear_active_buffer",
-            "note":     "Upstream does not expose DELETE /api/crawls/<id>; cleared the active in-memory crawler. DB record remains.",
-            "upstream": result,
-        }
-    except Exception as e:
-        return {
-            "success":  False,
-            "crawl_id": crawl_id,
-            "error":    f"Both delete and clear_data failed: {e}",
-        }
+    result = _delete_upstream_crawl(crawl_id)
+    out = {"success": result["ok"], "crawl_id": crawl_id, "method": result["method"],
+           "detail": result.get("detail")}
+    if not result["ok"]:
+        out["error"] = result.get("rest_error") or "upstream delete failed"
+    return out
 
 
-# ── v1.9.0 Ephemeral mode ─────────────────────────────────────────────────────
-# The MCP wrapper retains zero memory of audited sites by default. After a
-# successful chunked audit, the client calls librecrawl_audit_zip to receive
-# all 7 artifacts as a single base64-encoded zip — then everything is wiped:
-# session row in state.db, all artifact files on disk, and the upstream
-# LibreCrawl crawl record. The local client becomes the only source of truth.
+# ── Ephemeral mode (v1.9.0, confirm-before-wipe since v2.1.0) ────────────────
+# After a chunked audit the client calls librecrawl_audit_zip to receive all
+# artifacts as one base64-encoded zip, saves it, then calls
+# librecrawl_audit_confirm_saved with the sha256 of the saved file. Only then
+# is everything wiped: session rows in state.db, artifact files, the zip and
+# the upstream LibreCrawl crawl. Unconfirmed sessions are swept by
+# watchdog.py after TTL_DONE_S (default 1h), so nothing lingers indefinitely.
 
-# Upstream LibreCrawl's API doesn't expose DELETE /api/crawls/<id>, so we
-# delete rows directly from its SQLite. The `users.db` file holds users +
-# crawls + crawled_urls + crawl_links + crawl_issues. We touch the four
-# crawl tables only — never the users table.
+# Upstream exposes DELETE /api/crawls/<id>/delete. The bundled engine image is
+# patched (docker/patch-librecrawl.py) so that route also removes the crawl's
+# pages, links, issues and queue rows. The direct-sqlite path below is only a
+# fallback for deployments where the MCP can write the upstream DB.
 import sqlite3 as _sqlite3
 LIBRECRAWL_UPSTREAM_DB = Path(
     os.getenv("LIBRECRAWL_UPSTREAM_DB",
               str(Path.home() / ".librecrawl" / "upstream" / "users.db"))
 )
 
+_CRAWL_CHILD_TABLES = ("crawl_queue", "crawl_issues", "crawl_links", "crawled_urls")
+
+
+def _upstream_request(method: str, path: str, **kwargs) -> httpx.Response:
+    """Authenticated upstream request that re-auths once on 401. Does not raise on status."""
+    global _client
+    r = get_client().request(method, f"{BASE}{path}", **kwargs)
+    if r.status_code == 401:
+        _client = None
+        r = get_client().request(method, f"{BASE}{path}", **kwargs)
+    return r
+
+
+def _counts_ok(counts: dict) -> bool:
+    if not isinstance(counts, dict) or "skipped" in counts or "error" in counts:
+        return False
+    return all(isinstance(v, int) for v in counts.values())
+
 
 def _wipe_upstream_crawl_record(crawl_id: int) -> dict:
     """Delete a single crawl_id's rows directly from upstream LibreCrawl's
-    sqlite. Returns row-counts per table. Best-effort — never raises.
-
-    Schema: crawls.id is PK; other tables key by crawl_id FK.
+    sqlite. Returns row-counts per table, or error strings. Never raises.
+    Records the error when the DB is mounted read-only.
     """
     if crawl_id is None:
         return {"skipped": "no crawl_id"}
@@ -3678,14 +3829,12 @@ def _wipe_upstream_crawl_record(crawl_id: int) -> dict:
     try:
         conn = _sqlite3.connect(str(LIBRECRAWL_UPSTREAM_DB), timeout=15.0)
         conn.execute("PRAGMA busy_timeout = 5000")
-        # FK-keyed tables first (preserve referential safety)
-        for table in ("crawl_issues", "crawl_links", "crawled_urls"):
+        for table in _CRAWL_CHILD_TABLES:
             try:
                 cur = conn.execute(f"DELETE FROM {table} WHERE crawl_id = ?", (crawl_id,))
                 counts[table] = cur.rowcount
             except Exception as e:
                 counts[table] = f"error: {e}"
-        # crawls.id is the PK
         try:
             cur = conn.execute("DELETE FROM crawls WHERE id = ?", (crawl_id,))
             counts["crawls"] = cur.rowcount
@@ -3698,58 +3847,135 @@ def _wipe_upstream_crawl_record(crawl_id: int) -> dict:
     return counts
 
 
-def _wipe_all_upstream_crawls() -> dict:
-    """Truncate upstream LibreCrawl's crawl tables entirely. Returns counts."""
-    if not LIBRECRAWL_UPSTREAM_DB.exists():
-        return {"skipped": f"upstream db not found at {LIBRECRAWL_UPSTREAM_DB}"}
-    counts = {}
+def _delete_upstream_crawl(crawl_id) -> dict:
+    """Delete one upstream crawl. Returns {"ok", "method", "detail", "rest_error"?}.
+
+    REST first (DELETE /api/crawls/<id>/delete). A 404 means the record is
+    already gone, which is the state we want. If REST fails, try the direct
+    sqlite delete and report its real outcome.
+    """
+    if crawl_id is None:
+        return {"ok": True, "method": "skipped", "detail": "no upstream crawl id"}
+    rest_error = None
     try:
-        conn = _sqlite3.connect(str(LIBRECRAWL_UPSTREAM_DB), timeout=15.0)
-        conn.execute("PRAGMA busy_timeout = 5000")
-        for table in ("crawl_issues", "crawl_links", "crawled_urls", "crawls"):
-            try:
-                cur = conn.execute(f"DELETE FROM {table}")
-                counts[table] = cur.rowcount
-            except Exception as e:
-                counts[table] = f"error: {e}"
-        conn.commit()
-        conn.close()
+        r = _upstream_request("DELETE", f"/api/crawls/{int(crawl_id)}/delete", timeout=30)
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
+        if r.status_code == 200 and body.get("success"):
+            return {"ok": True, "method": "rest", "detail": body.get("message")}
+        if r.status_code == 404:
+            return {"ok": True, "method": "already_absent", "detail": body.get("error")}
+        rest_error = f"HTTP {r.status_code}: {body.get('error') or r.text[:200]}"
     except Exception as e:
-        counts["error"] = str(e)
-    return counts
+        rest_error = f"{type(e).__name__}: {e}"
+    counts = _wipe_upstream_crawl_record(crawl_id)
+    return {"ok": _counts_ok(counts), "method": "sqlite_fallback",
+            "detail": counts, "rest_error": rest_error}
+
+
+def _list_upstream_crawl_ids() -> list:
+    ids, offset = [], 0
+    while True:
+        r = _upstream_request("GET", f"/api/crawls/list?limit=200&offset={offset}", timeout=30)
+        r.raise_for_status()
+        batch = r.json().get("crawls") or []
+        ids.extend(c.get("id") for c in batch if c.get("id") is not None)
+        if len(batch) < 200:
+            return ids
+        offset += 200
+
+
+def _wipe_all_upstream_crawls() -> dict:
+    """Delete every upstream crawl via the REST route. Returns counts + failures."""
+    out = {"listed": 0, "deleted": 0, "failed": []}
+    try:
+        ids = _list_upstream_crawl_ids()
+    except Exception as e:
+        out["error"] = f"could not list upstream crawls: {type(e).__name__}: {e}"
+        return out
+    out["listed"] = len(ids)
+    for cid in ids:
+        res = _delete_upstream_crawl(cid)
+        if res["ok"]:
+            out["deleted"] += 1
+        else:
+            out["failed"].append({"crawl_id": cid, "error": res.get("rest_error"), "detail": res.get("detail")})
+    return out
+
+
+def _safe_domain(url: str) -> str:
+    """Filesystem-safe host label for artifact filenames ("ftp:" and ports never leak in)."""
+    host = urlparse(url or "").hostname or ""
+    if not host:
+        host = (url or "").replace("https://", "").replace("http://", "").split("/")[0]
+    return re.sub(r"[^A-Za-z0-9.-]+", "-", host).strip("-.") or "unknown"
+
+
+def _cleanup_session(session_id: str, s: dict, arts: list, zip_path) -> dict:
+    """Wipe artifacts, the zip, the session rows and the upstream crawl.
+    Returns a cleanup report whose `ok` is True only if every step succeeded."""
+    from pathlib import Path as _Path
+    cleanup = {"files_deleted": 0, "file_errors": [], "session_rows": None,
+               "upstream": None, "zip_file_deleted": None}
+    for art in arts:
+        try:
+            p = _Path(art["path"])
+            if p.exists():
+                p.unlink()
+                cleanup["files_deleted"] += 1
+        except Exception as e:
+            cleanup["file_errors"].append(f"{art.get('path')}: {e}")
+    if zip_path is not None:
+        try:
+            zp = _Path(zip_path)
+            if zp.exists():
+                zp.unlink()
+            cleanup["zip_file_deleted"] = True
+        except Exception as e:
+            cleanup["zip_file_deleted"] = False
+            cleanup["file_errors"].append(f"{zip_path}: {e}")
+    session_ok = True
+    try:
+        cleanup["session_rows"] = _state.delete_session(session_id)
+    except Exception as e:
+        cleanup["session_rows"] = f"error: {e}"
+        session_ok = False
+    up = _delete_upstream_crawl(s.get("upstream_crawl_id"))
+    cleanup["upstream"] = up
+    cleanup["ok"] = (not cleanup["file_errors"]) and session_ok and up["ok"]
+    return cleanup
+
+
+def _zip_path_for(session_id: str, s: dict):
+    return REPORTS_DIR / f"{_safe_domain(s.get('url', ''))}-{session_id[:8]}.zip"
+
 
 @mcp.tool()
-def librecrawl_audit_zip(session_id: str, auto_cleanup: bool = True) -> dict:
+def librecrawl_audit_zip(session_id: str, auto_cleanup: bool = False) -> dict:
     """
-    Download the finished audit as a zip + ephemeral cleanup. v2.0.3.
+    Download the finished audit as a zip. v2.1.
 
-    ⚠️ MANDATORY for the calling agent:
-      1. base64-decode `content_base64` and write to a LOCAL file using the
-         response's `filename` field. Do this IMMEDIATELY before reporting
-         back to the user.
-      2. Report the LOCAL path you saved to. NEVER report `zip_path` — that
-         path is on the REMOTE server and the operator cannot open it.
-      3. Always call with auto_cleanup=True (the default). The base64 in
-         the response IS the preserved copy; auto_cleanup=False just leaves
-         duplicate data on the server.
+    Flow for the calling agent:
+      1. base64-decode `content_base64` and write it to a LOCAL file named
+         `filename`. Report the LOCAL path, never `zip_path` (that is on the
+         remote server).
+      2. Compute sha256 of the saved file and call
+         librecrawl_audit_confirm_saved(session_id, sha256). The server wipes
+         the session, artifacts and upstream crawl only after that check
+         passes, so a failed save never loses the only copy.
 
     Args:
         session_id:    From librecrawl_start_chunked_audit() once status=done.
-        auto_cleanup:  True (default + recommended). Wipes session row +
-                       artifact files + upstream LibreCrawl crawl record
-                       atomically with the response. False is a discouraged
-                       preview-only mode that leaves data on the server —
-                       avoid unless you have a specific reason and intend
-                       to call librecrawl_wipe_everything() to clean up.
+        auto_cleanup:  False (default). True wipes everything in the same call,
+                       before the caller has saved anything. Use only when the
+                       client cannot make a second call.
 
     Returns:
-      filename:                 e.g. "<domain>-<unix-ts>.zip"
-      save_to_local_filename:   echoes filename — save the base64 here
-      size_bytes / file_count / sha256: integrity metadata
-      content_base64:           zip content, base64-encoded (decode + save locally)
-      zip_path / zip_path_is_remote: REMOTE server path, not for client use
-      cleanup:                  what was wiped server-side
-      note:                     embedded usage reminder for the calling agent
+      filename / save_to_local_filename, size_bytes, file_count, sha256,
+      content_base64, zip_path (remote), next_step, and cleanup + cleanup_ok
+      when auto_cleanup=True.
     """
     import base64 as _b64
     import hashlib as _hl
@@ -3768,19 +3994,16 @@ def librecrawl_audit_zip(session_id: str, auto_cleanup: bool = True) -> dict:
     if not arts:
         return {"success": False, "error": "No artifacts registered for this session"}
 
-    # Build zip in memory
     buf = _io.BytesIO()
     files_added, missing = [], []
     with _zf.ZipFile(buf, "w", compression=_zf.ZIP_DEFLATED, compresslevel=6) as zf:
-        # SUMMARY.txt at top — quick orientation for the client
         url = s.get("url", "")
-        domain = url.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
         summary_lines = [
             "LibreCrawl MCP — Audit Bundle",
-            "By Aditya Sharma — github.com/adityaarsharma/librecrawl-mcp",
+            "github.com/adityaarsharma/librecrawl-technical-seo-audit-mcp",
             "",
             f"Site:        {url}",
-            f"Session ID:  {session_id} (deleted on server after zip delivery)",
+            f"Session ID:  {session_id}",
             f"Upstream ID: {s.get('upstream_crawl_id')}",
             f"Pages:       {s.get('pages_done')}",
             f"Audit complete: {bool(s.get('audit_complete'))}",
@@ -3802,95 +4025,88 @@ def librecrawl_audit_zip(session_id: str, auto_cleanup: bool = True) -> dict:
             zf.write(src, arcname=src.name)
             files_added.append({"kind": art["kind"], "name": src.name, "bytes": src.stat().st_size})
 
-    # v1.9.1 — include SUMMARY.txt in the file listing + count. Previous file_count
-    # was len(files_added) which missed it. Now bundle = artifacts + SUMMARY.txt.
-    files_added.insert(0, {
-        "kind": "summary",
-        "name": "SUMMARY.txt",
-        "bytes": len(summary_text.encode("utf-8")),
-    })
+    files_added.insert(0, {"kind": "summary", "name": "SUMMARY.txt",
+                           "bytes": len(summary_text.encode("utf-8"))})
 
     zip_bytes = buf.getvalue()
     sha256 = _hl.sha256(zip_bytes).hexdigest()
-    filename = f"{domain}-{int(s.get('finished_at') or s.get('updated_at') or 0)}.zip"
+    zip_path = _zip_path_for(session_id, s)
+    filename = zip_path.name
     content_b64 = _b64.b64encode(zip_bytes).decode("ascii")
 
-    # v1.9.1 — also write the zip to REPORTS_DIR so clients that prefer a
-    # filesystem download have a path to grab. With auto_cleanup=True the
-    # file is unlinked immediately after the response is built; the path is
-    # for THIS response only. With auto_cleanup=False it persists.
+    # The on-disk zip is what librecrawl_audit_confirm_saved checks the
+    # caller's sha256 against, so a write failure is a hard error unless the
+    # caller opted into auto_cleanup (which never needs the file).
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    zip_path = REPORTS_DIR / filename
     try:
         zip_path.write_bytes(zip_bytes)
         zip_path_str = str(zip_path)
     except Exception as e:
         zip_path_str = f"error_writing_zip: {e}"
+        if not auto_cleanup:
+            return {"success": False, "error": f"Could not write zip on the server: {e}"}
 
-    cleanup = {"session_rows": None, "files_deleted": 0, "upstream": "skipped"}
-    if auto_cleanup:
-        # Wipe artifact files on disk (the zip file IS one of them now too)
-        for art in arts:
-            try:
-                p = _Path(art["path"])
-                if p.exists():
-                    p.unlink()
-                    cleanup["files_deleted"] += 1
-            except Exception:
-                pass
-        # Wipe state DB rows for this session
-        try:
-            cleanup["session_rows"] = _state.delete_session(session_id)
-        except Exception as e:
-            cleanup["session_rows"] = f"error: {e}"
-        # Wipe upstream LibreCrawl crawl record. Try the REST DELETE first
-        # (in case upstream gets it added in future); fall back to direct
-        # sqlite row delete since current upstream doesn't expose the route.
-        upstream_id = s.get("upstream_crawl_id")
-        if upstream_id:
-            api_ok = False
-            try:
-                r = get_client().delete(f"{BASE}/api/crawls/{upstream_id}", timeout=15)
-                if r.status_code in (200, 204):
-                    cleanup["upstream"] = f"deleted upstream crawl {upstream_id} via REST"
-                    api_ok = True
-            except Exception:
-                pass
-            if not api_ok:
-                cleanup["upstream"] = _wipe_upstream_crawl_record(upstream_id)
-        # And finally unlink the zip itself — caller has already received the bytes
-        try:
-            if zip_path.exists():
-                zip_path.unlink()
-                cleanup["zip_file_deleted"] = True
-        except Exception:
-            cleanup["zip_file_deleted"] = False
-
-    return {
+    out = {
         "success":         True,
         "session_id":      session_id,
         "filename":        filename,
+        "save_to_local_filename": filename,
         "size_bytes":      len(zip_bytes),
         "file_count":      len(files_added),
         "files":           files_added,
         "missing":         missing,
         "sha256":          sha256,
         "content_base64":  content_b64,
-        "zip_path":               zip_path_str,
-        "zip_path_persistent":    (not auto_cleanup),
-        "zip_path_is_remote":     True,
-        "save_to_local_filename": filename,
-        "cleanup":                cleanup,
-        "note": ("MANDATORY for the calling agent: base64-decode `content_base64` and write it to a "
-                 f"LOCAL file on the operator's machine named `{filename}`. The `zip_path` field is on the REMOTE "
-                 "server, not the operator's machine — never report it as the deliverable. "
-                 "Server-side state is wiped; the base64 in this response is the only copy. "
-                 "Report back to the user with the LOCAL path you saved to."
-                 if auto_cleanup
-                 else f"auto_cleanup=False — zip persists on the REMOTE server at {zip_path_str}. "
-                      "AGENT MUST STILL base64-decode + save locally; the remote path is not the deliverable. "
-                      "Call librecrawl_audit_zip() again with True or librecrawl_wipe_everything() to clear."),
+        "zip_path":           zip_path_str,
+        "zip_path_is_remote": True,
     }
+    if auto_cleanup:
+        cleanup = _cleanup_session(session_id, s, arts, zip_path)
+        out["cleanup"] = cleanup
+        out["cleanup_ok"] = cleanup["ok"]
+        out["next_step"] = ("Save content_base64 locally now: the server copy is already deleted."
+                            if cleanup["ok"] else
+                            "Save content_base64 locally now. Server cleanup was INCOMPLETE, see cleanup; "
+                            "run librecrawl_wipe_everything(confirm=True) or clean up manually.")
+    else:
+        out["next_step"] = (f"base64-decode content_base64 into a local file named {filename}, then call "
+                            f"librecrawl_audit_confirm_saved(session_id='{session_id}', sha256=<sha256 of the saved file>) "
+                            "to delete the server copy. Unconfirmed audits are swept by the watchdog after its TTL.")
+    return out
+
+
+@mcp.tool()
+def librecrawl_audit_confirm_saved(session_id: str, sha256: str) -> dict:
+    """
+    Confirm the audit zip was saved locally, then wipe the server copy.
+
+    Pass the sha256 of the file you saved. If it matches the zip the server
+    built, the session rows, every artifact file, the zip and the upstream
+    LibreCrawl crawl are deleted. A mismatch deletes nothing, so you can
+    re-save and retry.
+
+    Returns success True only when every cleanup step succeeded.
+    """
+    import hashlib as _hl
+
+    s = _state.get_session(session_id)
+    if not s:
+        return {"success": False, "error": f"Unknown session_id: {session_id}"}
+    zip_path = _zip_path_for(session_id, s)
+    if not zip_path.exists():
+        return {"success": False, "error": "No zip has been built for this session. Call librecrawl_audit_zip first."}
+    expected = _hl.sha256(zip_path.read_bytes()).hexdigest()
+    given = (sha256 or "").strip().lower()
+    if given != expected:
+        return {"success": False, "error": "sha256 mismatch: the saved file is not the zip the server built. "
+                "Nothing was deleted. Re-save content_base64 and retry.",
+                "expected_sha256": expected}
+    arts = _state.list_artifacts(session_id)
+    cleanup = _cleanup_session(session_id, s, arts, zip_path)
+    out = {"success": cleanup["ok"], "session_id": session_id, "cleanup": cleanup}
+    if not cleanup["ok"]:
+        out["error"] = "cleanup incomplete, see cleanup"
+    return out
 
 
 @mcp.tool()
@@ -3900,13 +4116,9 @@ def librecrawl_wipe_everything(confirm: bool = False) -> dict:
     file in REPORTS_DIR, every LibreCrawl upstream crawl record. Use to
     return the MCP to a zero-memory baseline.
 
-    REQUIRES confirm=True. Default refuses to fire.
-
-    Returns counts: sessions wiped, files deleted, upstream crawls deleted,
-    and bytes reclaimed on disk.
+    REQUIRES confirm=True. Default refuses to fire. `success` is True only
+    when every step succeeded; otherwise `wiped.errors` lists what is left.
     """
-    from pathlib import Path as _Path
-
     if not confirm:
         return {"success": False, "error": "Pass confirm=True to actually wipe. "
                 "This will delete ALL audit history — there is no undo."}
@@ -3914,7 +4126,6 @@ def librecrawl_wipe_everything(confirm: bool = False) -> dict:
     counts = {"sessions": 0, "files_deleted": 0, "bytes_reclaimed": 0,
               "upstream_crawls_deleted": 0, "errors": []}
 
-    # 1. Wipe artifact files from REPORTS_DIR
     if REPORTS_DIR.exists():
         for f in REPORTS_DIR.iterdir():
             if f.is_file():
@@ -3926,7 +4137,6 @@ def librecrawl_wipe_everything(confirm: bool = False) -> dict:
                 except Exception as e:
                     counts["errors"].append(f"unlink {f}: {e}")
 
-    # 2. Delete every session row + chunks/artifacts/events
     try:
         sessions = _state.list_all_sessions()
         counts["sessions"] = len(sessions)
@@ -3938,19 +4148,20 @@ def librecrawl_wipe_everything(confirm: bool = False) -> dict:
     except Exception as e:
         counts["errors"].append(f"list_all_sessions: {e}")
 
-    # 3. Truncate upstream LibreCrawl crawl tables (direct sqlite — upstream
-    #    doesn't expose DELETE on its REST API).
-    try:
-        upstream = _wipe_all_upstream_crawls()
-        counts["upstream_crawls_deleted"] = upstream.get("crawls", 0) if isinstance(upstream.get("crawls"), int) else 0
-        counts["upstream_detail"] = upstream
-    except Exception as e:
-        counts["errors"].append(f"upstream wipe: {e}")
+    upstream = _wipe_all_upstream_crawls()
+    counts["upstream_crawls_deleted"] = upstream.get("deleted", 0)
+    counts["upstream_detail"] = upstream
+    if upstream.get("error"):
+        counts["errors"].append(upstream["error"])
+    for f in upstream.get("failed", []):
+        counts["errors"].append(f"upstream crawl {f['crawl_id']}: {f['error']}")
 
+    ok = not counts["errors"]
     return {
-        "success":   True,
-        "wiped":     counts,
-        "note":      "MCP is now at zero-memory baseline. Future audits should call librecrawl_audit_zip with auto_cleanup=True to stay ephemeral.",
+        "success": ok,
+        "wiped":   counts,
+        "note":    ("MCP is now at zero-memory baseline." if ok else
+                    "Wipe INCOMPLETE — see wiped.errors for what remains."),
     }
 
 

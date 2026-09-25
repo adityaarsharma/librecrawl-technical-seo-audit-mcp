@@ -52,6 +52,56 @@ def log(msg: str) -> None:
         pass
 
 
+LIBRECRAWL_URL = os.environ.get('LIBRECRAWL_URL',
+                                f"http://127.0.0.1:{os.environ.get('LIBRECRAWL_PORT', '5080')}")
+_CHILD_TABLES = ('crawl_queue', 'crawl_issues', 'crawl_links', 'crawled_urls')
+
+
+def _rest_delete(crawl_ids: list) -> list:
+    """Delete through LibreCrawl's own API. Returns the ids it could NOT delete."""
+    try:
+        import httpx
+        c = httpx.Client(timeout=30)
+        c.post(f'{LIBRECRAWL_URL}/api/login', json={'username': 'mcp-user'}).raise_for_status()
+    except Exception as e:
+        log(f'watchdog: upstream API unavailable ({e}), falling back to sqlite')
+        return list(crawl_ids)
+    left = []
+    with c:
+        for cid in crawl_ids:
+            try:
+                r = c.delete(f'{LIBRECRAWL_URL}/api/crawls/{cid}/delete')
+                if r.status_code not in (200, 404):
+                    left.append(cid)
+            except Exception:
+                left.append(cid)
+    return left
+
+
+def _purge_upstream(crawl_ids: list) -> None:
+    left = _rest_delete(crawl_ids)
+    done = len(crawl_ids) - len(left)
+    if left and os.path.exists(UPSTREAM_DB):
+        try:
+            udb = sqlite3.connect(UPSTREAM_DB)
+            ucur = udb.cursor()
+            for cid in left:
+                # Child tables are keyed by crawl_id only; `id` there is the row's own id.
+                for t in _CHILD_TABLES:
+                    try:
+                        ucur.execute(f'DELETE FROM {t} WHERE crawl_id = ?', (cid,))
+                    except Exception as e:
+                        log(f'watchdog: upstream {t} delete error: {e}')
+                ucur.execute('DELETE FROM crawls WHERE id = ?', (cid,))
+                done += 1
+            udb.commit()
+            udb.close()
+            left = []
+        except Exception as e:
+            log(f'watchdog: upstream DB error: {e}')
+    log(f'watchdog: purged {done} upstream crawl records' + (f', {len(left)} failed: {left}' if left else ''))
+
+
 def main() -> int:
     if not os.path.exists(STATE_DB):
         log('watchdog: no state.db yet — nothing to do')
@@ -78,12 +128,13 @@ def main() -> int:
             purge_ids.append((sid, reason))
             if upstream:
                 purge_upstream.append(upstream)
-    if not purge_ids:
-        log(f'watchdog: scanned {len(rows)} sessions, 0 to purge')
-        return 0
     for sid, reason in purge_ids:
-        for table in ('events', 'artifacts', 'chunks', 'sessions'):
-            cur.execute(f'DELETE FROM {table} WHERE session_id = ? OR id = ?', (sid, sid))
+        # Child tables key on session_id; only `sessions` has an `id` column.
+        # Querying `id` on a child table raised "no such column: id" and
+        # aborted every run before anything was purged.
+        for table in ('events', 'artifacts', 'chunks'):
+            cur.execute(f'DELETE FROM {table} WHERE session_id = ?', (sid,))
+        cur.execute('DELETE FROM sessions WHERE id = ?', (sid,))
         log(f'watchdog: purged session {sid} ({reason})')
     sdb.commit()
     sdb.close()
@@ -102,22 +153,9 @@ def main() -> int:
                 log(f'watchdog: error deleting {fp}: {e}')
     if purged_files:
         log(f'watchdog: purged {purged_files} orphan files ({purged_bytes} bytes)')
-    if purge_upstream and os.path.exists(UPSTREAM_DB):
-        try:
-            udb = sqlite3.connect(UPSTREAM_DB)
-            ucur = udb.cursor()
-            for cid in purge_upstream:
-                for t in ('crawl_issues', 'crawl_links', 'crawled_urls', 'crawls'):
-                    try:
-                        ucur.execute(f'DELETE FROM {t} WHERE crawl_id = ? OR id = ?', (cid, cid))
-                    except Exception as e:
-                        log(f'watchdog: upstream {t} delete error: {e}')
-            udb.commit()
-            udb.close()
-            log(f'watchdog: purged {len(purge_upstream)} upstream crawl records')
-        except Exception as e:
-            log(f'watchdog: upstream DB error: {e}')
-    log(f'watchdog: cycle complete — purged {len(purge_ids)} sessions')
+    if purge_upstream:
+        _purge_upstream(purge_upstream)
+    log(f'watchdog: scanned {len(rows)} sessions, purged {len(purge_ids)}')
     return 0
 
 
