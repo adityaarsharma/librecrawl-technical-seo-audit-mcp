@@ -48,6 +48,8 @@ The upstream open-source [LibreCrawl](https://github.com/PhialsBasement/LibreCra
 
 LibreCrawl reads its `session_id` before the crawler that creates it is initialized, which leaves `crawl_id` null and prevents results from being written to its database — audits come back empty. The Docker image applies a small patch (`docker/patch-librecrawl.py`) that moves the `session_id` read to after `get_or_create_crawler()`. If you run LibreCrawl yourself (not via this repo's Docker image), apply the same patch, or use the one-liner installer, which applies it for you.
 
+The same script applies two more fixes. `delete_crawl()` deletes the crawl's child rows (pages, links, issues, queue), because upstream relies on a cascade SQLite never runs. And `response_time` records the server's answer time (`response.elapsed`) instead of the time spent parsing the page and checking its images, which made most pages look slow.
+
 ## Ephemeral by design
 
 After you save an audit and call `librecrawl_audit_confirm_saved` with the zip's sha256, the server deletes the session rows, every artifact file, the zip and the upstream LibreCrawl crawl record (through LibreCrawl's own delete API, including its child tables). A hash mismatch deletes nothing. Unconfirmed zips are swept after an hour. Your downloaded zip is then the only copy.

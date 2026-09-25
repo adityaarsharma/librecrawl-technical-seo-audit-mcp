@@ -323,7 +323,7 @@ Single zip, 9 files:
 | `SUMMARY.txt` | One-page orientation |
 | `<domain>-<ts>.pdf` | **Branded human-readable PDF** (open in any viewer) |
 | `<domain>-<ts>.md` | Markdown source of the PDF (grep-friendly) |
-| `per-page.csv` | 1 row per URL × 30 columns of check booleans + `failed_checks_list` |
+| `per-page.csv` | 1 row per URL × 30 columns of check booleans + `failed_checks_list` + `fetch_error` |
 | `sitemap-recon.csv` | Sitemap-vs-crawl diff |
 | `external-links.csv` | Every outbound URL + status |
 | `content-audit.csv` | Per-page readability + AI-tells |
