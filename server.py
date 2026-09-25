@@ -78,7 +78,7 @@ failed local save then loses the audit.
 
 # What the audit produces
 
-A single zip with 8 files:
+A single zip with 9 files:
   - SUMMARY.txt — orientation
   - <domain>-<ts>.pdf — branded human-readable report (PDF)
   - <domain>-<ts>.md  — Markdown source
@@ -87,6 +87,7 @@ A single zip with 8 files:
   - <domain>-<ts>.external-links.csv — every outbound URL HEAD-validated
   - <domain>-<ts>.content-audit.csv — readability, AI-tells, punctuation
   - <domain>-<ts>.extended-checks.csv — 50+ technical SEO findings
+  - <domain>-<ts>.schema-validation.csv — JSON-LD checks against Google rich-result fields
 
 The PDF report surfaces the Summary scorecard (with external-link counts),
 a Critical section with broken pages + broken external links + duplicate

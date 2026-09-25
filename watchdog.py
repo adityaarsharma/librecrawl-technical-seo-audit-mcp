@@ -17,6 +17,9 @@ Cascades:
   - REPORTS_DIR files older than TTL_DONE_S
   - Upstream LibreCrawl DB crawl records (crawls, crawled_urls,
     crawl_links, crawl_issues)
+  - Upstream crawls no remaining session owns, once older than
+    TTL_UPSTREAM_S (default TTL_CRAWLING_S). Catches crawls whose session
+    row is already gone, so upstream never accumulates audit data.
 
 Env vars (defaults shown):
   LIBRECRAWL_STATE_DB     = ~/librecrawl-state.db
@@ -38,6 +41,7 @@ LOG_PATH     = os.environ.get('LIBRECRAWL_WATCHDOG_LOG', f'{HOME}/librecrawl-wat
 TTL_DONE_S     = int(os.environ.get('TTL_DONE_S',     60 * 60))
 TTL_CRAWLING_S = int(os.environ.get('TTL_CRAWLING_S', 4 * 60 * 60))
 TTL_QUEUED_S   = int(os.environ.get('TTL_QUEUED_S',   30 * 60))
+TTL_UPSTREAM_S = int(os.environ.get('TTL_UPSTREAM_S', TTL_CRAWLING_S))
 
 NOW = time.time()
 
@@ -67,7 +71,7 @@ def _rest_delete(crawl_ids: list) -> list:
         log(f'watchdog: upstream API unavailable ({e}), falling back to sqlite')
         return list(crawl_ids)
     left = []
-    with c:
+    try:
         for cid in crawl_ids:
             try:
                 r = c.delete(f'{LIBRECRAWL_URL}/api/crawls/{cid}/delete')
@@ -75,7 +79,27 @@ def _rest_delete(crawl_ids: list) -> list:
                     left.append(cid)
             except Exception:
                 left.append(cid)
+    finally:
+        c.close()
     return left
+
+
+def _orphan_upstream(keep_ids: set) -> list:
+    """Upstream crawls older than TTL_UPSTREAM_S that no remaining session owns."""
+    if not os.path.exists(UPSTREAM_DB):
+        return []
+    try:
+        udb = sqlite3.connect(f'file:{UPSTREAM_DB}?mode=ro', uri=True)
+        rows = udb.execute(
+            "SELECT id FROM crawls WHERE "
+            "datetime(COALESCE(last_saved_at, completed_at, started_at)) < datetime('now', ?)",
+            (f'-{TTL_UPSTREAM_S} seconds',),
+        ).fetchall()
+        udb.close()
+    except Exception as e:
+        log(f'watchdog: upstream orphan scan error: {e}')
+        return []
+    return [r[0] for r in rows if r[0] not in keep_ids]
 
 
 def _purge_upstream(crawl_ids: list) -> None:
@@ -137,7 +161,13 @@ def main() -> int:
         cur.execute('DELETE FROM sessions WHERE id = ?', (sid,))
         log(f'watchdog: purged session {sid} ({reason})')
     sdb.commit()
+    keep = {r[0] for r in cur.execute(
+        'SELECT upstream_crawl_id FROM sessions WHERE upstream_crawl_id IS NOT NULL')}
     sdb.close()
+    orphans = [c for c in _orphan_upstream(keep) if c not in purge_upstream]
+    if orphans:
+        log(f'watchdog: {len(orphans)} upstream crawls with no session, older than {TTL_UPSTREAM_S}s')
+        purge_upstream.extend(orphans)
     purged_files = 0
     purged_bytes = 0
     if os.path.isdir(REPORTS_DIR):

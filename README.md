@@ -316,7 +316,7 @@ Article · Product · Recipe · FAQPage · BreadcrumbList · Event · JobPosting
 
 ## 📊 What every audit produces
 
-Single zip, 8 files:
+Single zip, 9 files:
 
 | File | Use |
 |---|---|
@@ -328,6 +328,7 @@ Single zip, 8 files:
 | `external-links.csv` | Every outbound URL + status |
 | `content-audit.csv` | Per-page readability + AI-tells |
 | `extended-checks.csv` | 1 row per (URL × check × severity × detail) — all 50+ checks |
+| `schema-validation.csv` | JSON-LD findings per page against schema.org and Google rich-result required fields |
 
 ---
 
@@ -345,7 +346,7 @@ Agent: → librecrawl_start_chunked_audit(url=..., total_max_pages=10000)
          status: done,     pages_done: 534, artifacts_ready: true
 
        → librecrawl_audit_zip(session_id)
-         returns base64 zip (8 files, 320 KB) + sha256
+         returns base64 zip (9 files, 320 KB) + sha256
          SAVES LOCALLY as example.com-1a2b3c4d.zip
 
        → librecrawl_audit_confirm_saved(session_id, sha256=<hash of saved file>)

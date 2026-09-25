@@ -21,6 +21,12 @@
 - Content audit and extended checks cover every crawled page again (batched fetch, bounded
   memory) instead of the first 500, the fetch timeout is 45s, and a `schema-validation.csv`
   artifact is written for every audit. These were running in production but missing from the repo.
+- Watchdog REST delete reopened an HTTP client it was already using and crashed, so upstream
+  crawls were never removed through the API. It also now removes upstream crawls that no session
+  owns once they are older than `TTL_UPSTREAM_S` (default 4h), so crawls whose session row is gone
+  no longer pile up.
+- `docker/patch-librecrawl.py` keeps upstream's CRLF line endings instead of rewriting the whole
+  file, and stops if the second half of the session patch cannot apply.
 - Response times were always blank: the export asked for a field upstream does not have.
   Now read from `response_time` (ms).
 - The homepage was counted as an orphan page. The seed is excluded everywhere orphans are counted.
