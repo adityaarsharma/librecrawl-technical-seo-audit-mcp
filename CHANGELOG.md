@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.3.1] — 2026-09-25
+### Fixed
+- **Bot-challenge pages are no longer audited as the site.** A crawl behind Cloudflare (or
+  another WAF) returned "Just a moment..." pages that were scored as broken pages, filled the
+  Critical section and counted as sitemap coverage. Challenge pages are now removed from every
+  count, reported as a `bot_challenge` incomplete reason, and treated as missed sitemap URLs. If
+  more than 20% of pages are challenged, the sitemap fill stops sending requests. An audit where
+  every page was challenged fails with a clear "allowlist the crawler" message.
+- **Images and other files are no longer checked as pages.** URLs ending in image, font, media,
+  document or asset extensions skip page-level checks (title, H1, viewport), so an image is not
+  flagged for a missing H1.
+- A page cap is now exact: upstream could return one page over `total_max_pages`.
+- `librecrawl_get_settings` returns the crawl-shaping settings only. Pass `full=True` for the
+  whole dict, including the ~2,500 token default exclusion lists.
+
 ## [2.3.0] — 2026-09-25
 ### Security
 - **SSRF guard on every outbound fetch** (`url_guard.py`). Crawl seeds, robots and sitemap
