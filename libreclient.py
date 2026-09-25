@@ -44,7 +44,7 @@ def _base():
 # ── Crawl lifecycle ───────────────────────────────────────────────────────────
 
 def start_crawl(url: str, max_pages: int = 0, crawl_delay_s: float = 0.5,
-                max_depth: int = 5) -> dict:
+                max_depth: int = 5, concurrency: int = 3) -> dict:
     """Kick off a new crawl on the upstream. Returns {success, crawl_id, message}.
 
     max_pages=0 → unlimited. The runner uses this with its own total_max_pages
@@ -56,6 +56,7 @@ def start_crawl(url: str, max_pages: int = 0, crawl_delay_s: float = 0.5,
         "crawlDelay":         crawl_delay_s,
         "followRedirects":    True,
         "crawlExternalLinks": False,
+        "concurrency":        concurrency,
     }
     if max_pages > 0:
         settings["maxUrls"] = max_pages

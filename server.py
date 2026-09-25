@@ -3361,8 +3361,10 @@ def librecrawl_start_chunked_audit(url: str, total_max_pages: int = 10000,
                             confirm_unbounded=True). Default 10,000.
         chunk_target_pages: Polling-window size — how often the controller
                             re-tunes crawlDelay. Default 50.
-        politeness:         "auto" (adaptive — default), "polite" (slow start
-                            + conservative tune), or "fast" (aggressive).
+        politeness:         "auto" (default: 3 workers, adaptive delay), "polite"
+                            (2 workers, delay never below 1.5 s), or "fast"
+                            (5 workers, adaptive delay). Use "polite" on small
+                            or uncached sites.
         confirm_unbounded:  Pass True only if you genuinely want total_max_pages=0.
                             Protects you from accidentally crawling Wikipedia.
         fill_sitemap_orphans: NEW IN v1.6 — after the main crawl finishes,
