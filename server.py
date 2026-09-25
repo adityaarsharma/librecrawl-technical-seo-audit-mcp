@@ -349,6 +349,14 @@ def get_client():
         return _client
 
 
+def _upstream_is_running(d: dict) -> bool:
+    """Upstream get_status() has no is_running key; its status string is the
+    only liveness signal ("running", "completed", "idle", "demo_stopped")."""
+    if "is_running" in d:
+        return bool(d["is_running"])
+    return (d.get("status") or "").lower() == "running"
+
+
 def call(method, path, **kwargs):
     global _client
     r = get_client().request(method, f"{BASE}{path}", **kwargs)
@@ -381,7 +389,7 @@ def _ensure_crawler_ready() -> dict:
         return state
 
     stats      = s.get("stats", {}) or {}
-    is_running = bool(s.get("is_running"))
+    is_running = _upstream_is_running(s)
     status_str = (s.get("status") or "").lower()
     crawled    = stats.get("crawled", 0)
 
@@ -2188,7 +2196,8 @@ def librecrawl_get_status() -> dict:
     # Upstream sends the issue list at the top level, not a count in stats.
     issues = d.get("issues")
     return {
-        "is_running": d.get("is_running", False),
+        "is_running": _upstream_is_running(d),
+        "status":     (d.get("status") or "").lower(),
         "crawled":    stats.get("crawled", 0),
         "queued":     stats.get("queued", 0),
         "issues":     len(issues) if isinstance(issues, list) else stats.get("issues", 0),

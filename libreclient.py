@@ -31,6 +31,11 @@ def _client():
     return get_client()
 
 
+def _upstream_is_running(d):
+    from server import _upstream_is_running as f
+    return f(d)
+
+
 def _base():
     from server import BASE
     return BASE
@@ -101,10 +106,11 @@ def status() -> dict:
     try:
         d = _client_call("GET", "/api/crawl_status")
     except Exception as e:
-        return {"is_running": False, "error": str(e), "raw": {}}
+        # Unknown, not stopped: a failed poll must never read as "crawl finished".
+        return {"is_running": None, "error": str(e), "raw": {}}
     stats = d.get("stats", {}) or {}
     return {
-        "is_running": bool(d.get("is_running")),
+        "is_running": _upstream_is_running(d),
         "crawled":    stats.get("crawled", 0) or 0,
         "queued":     stats.get("queued", 0) or 0,
         "issues":     stats.get("issues", 0) or 0,

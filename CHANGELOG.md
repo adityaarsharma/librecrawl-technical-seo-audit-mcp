@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.3.2] — 2026-09-25
+
+### Fixed
+- Chunked audits ended on their first status poll. Upstream `get_status()` has no `is_running` key, so the runner always read the crawl as stopped: a slow first page (sitemap discovery) failed the audit with `upstream_stopped_zero_pages`, and a fast one finalized a partial crawl. Liveness now comes from the upstream `status` string (`running` vs `completed`/`idle`).
+- A failed status poll no longer counts as "crawl finished". It is retried; six failures in a row fail the audit with `upstream_unreachable`.
+- `librecrawl_get_status` reported `is_running: false` during every crawl, so agents following "poll until is_running=False" stopped at once. It now reports the real state plus the upstream `status`.
+
 ## [2.3.1] — 2026-09-25
 ### Fixed
 - **Bot-challenge pages are no longer audited as the site.** A crawl behind Cloudflare (or
