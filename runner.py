@@ -38,6 +38,7 @@ TARGET_ERR_RATE          = 0.02
 MIN_DELAY_MS             = 0
 MAX_DELAY_MS             = 5000
 SANITY_CEILING_PAGES     = 100_000   # Override needs confirm_unbounded=True
+STATUS_ERROR_LIMIT       = 6          # consecutive failed polls (~2 min) before giving up
 UPSTREAM_HEALTH_TIMEOUT  = 600        # 10 min of no-progress → throttled
 HARD_DEADLINE_SECONDS    = 43200      # 12 hr ceiling — full polite crawls of
                                       # very large heavy sites can run for
@@ -114,6 +115,7 @@ def _run_session(session: dict) -> None:
             pass  # Best-effort; full crash recovery deferred to v1.5
 
     # ── Polling loop ──
+    status_errors = 0
     while not _shutdown.is_set():
         # Refresh session row in case operator paused/cancelled
         cur = state.get_session(sid)
@@ -135,6 +137,16 @@ def _run_session(session: dict) -> None:
         time.sleep(POLL_INTERVAL_SECONDS)
 
         st = libreclient.status()
+        if st.get("error"):
+            status_errors += 1
+            state.log_event(sid, "status_poll_failed", st["error"][:300])
+            if status_errors >= STATUS_ERROR_LIMIT:
+                state.update_session(sid, incomplete_reasons="upstream_unreachable",
+                                     last_error=st["error"][:500])
+                state.set_status(sid, "failed", f"Upstream status failed {status_errors} polls in a row")
+                return
+            continue
+        status_errors = 0
         crawled = st.get("crawled", 0)
         queued = st.get("queued", 0)
         speed = st.get("speed_rps")
