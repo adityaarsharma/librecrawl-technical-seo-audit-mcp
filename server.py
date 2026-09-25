@@ -184,6 +184,65 @@ def _on_site(url: str, hosts: set) -> bool:
     return (urlparse(url or "").hostname or "").lower() in hosts
 
 
+# Titles a WAF or bot manager serves instead of the real page. Matching one
+# means the crawler never saw the page, so none of its findings are real.
+# Strong titles are only ever challenge pages. Weak ones are also plausible
+# article titles, so they count only on a blocking status code.
+CHALLENGE_TITLES = (
+    "just a moment", "attention required! | cloudflare", "checking your browser",
+    "ddos-guard", "pardon our interruption", "verifying you are human",
+)
+CHALLENGE_TITLES_WEAK = (
+    "access denied", "are you a robot", "security check", "one more step",
+    "request blocked", "please wait",
+)
+CHALLENGE_STATUSES = {403, 429, 503}
+
+# Files the crawler can follow from a page that are not pages. Page-level
+# checks (title, H1, viewport, meta description) do not apply to them.
+NON_PAGE_EXT = (
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg", ".ico", ".bmp",
+    ".tif", ".tiff", ".pdf", ".css", ".js", ".mjs", ".json", ".xml", ".txt",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp4", ".webm", ".mov", ".mp3",
+    ".wav", ".zip", ".gz", ".rar", ".7z", ".doc", ".docx", ".xls", ".xlsx",
+    ".ppt", ".pptx", ".csv",
+)
+
+
+def _is_challenge_page(p: dict) -> bool:
+    title = str(p.get("title") or "").strip().lower()
+    if not title:
+        return False
+    if title.startswith(CHALLENGE_TITLES):
+        return True
+    try:
+        status = int(p.get("status_code") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    return status in CHALLENGE_STATUSES and title.startswith(CHALLENGE_TITLES_WEAK)
+
+
+def _is_non_page(p: dict) -> bool:
+    if p.get("error_type") == "non_html_content":
+        return True
+    path = urlparse(p.get("url") or "").path.lower()
+    return path.endswith(NON_PAGE_EXT)
+
+
+def _split_audit_pages(pages: list) -> tuple:
+    """Split crawled rows into (real pages, challenge pages, non-page files).
+    Only real pages feed the report, the sitemap coverage and the checks."""
+    real, challenged, assets = [], [], []
+    for p in pages or []:
+        if _is_non_page(p):
+            assets.append(p)
+        elif _is_challenge_page(p):
+            challenged.append(p)
+        else:
+            real.append(p)
+    return real, challenged, assets
+
+
 def _is_orphan(p: dict, seed_url: str = "") -> bool:
     return not (p.get("linked_from") or []) and not _is_seed_page(p, seed_url)
 
@@ -2247,11 +2306,12 @@ def librecrawl_resume_from_crawl_id(crawl_id: int) -> dict:
 
 
 @mcp.tool()
-def librecrawl_get_settings() -> dict:
+def librecrawl_get_settings(full: bool = False) -> dict:
     """
     Get current crawler settings (maxUrls, maxDepth, crawlDelay, JS rendering, etc).
     Useful to confirm settings before starting a crawl. Returns the handful of
-    settings that shape a crawl up top, the full dict under `settings`.
+    settings that shape a crawl. Pass full=True for every setting, including the
+    long default exclusion lists (about 2,500 tokens).
     """
     d = call("GET", "/api/get_settings")
     st = d.get("settings") or {}
@@ -2259,7 +2319,7 @@ def librecrawl_get_settings() -> dict:
             "crawlExternalLinks", "respectRobotsTxt", "userAgent", "concurrency")
     return {"success": d.get("success", bool(st)),
             "summary": {k: st[k] for k in keys if k in st},
-            "settings": st,
+            **({"settings": st} if full else {"settings_omitted": len(st)}),
             **({"error": d["error"]} if d.get("error") else {})}
 
 
