@@ -370,6 +370,43 @@ def call(method, path, **kwargs):
         raise RuntimeError(f"LibreCrawl returned non-JSON ({r.status_code}): {r.text[:200]}")
 
 
+# ── Shared-crawler guard ─────────────────────────────────────────────────────
+# The legacy tools and the chunked runner drive ONE upstream crawler session.
+# _ensure_crawler_ready() force-stops whatever is running, so a legacy call made
+# during a chunked audit used to kill that audit. These helpers keep them apart.
+_LEGACY_CRAWL = threading.Lock()
+_LEGACY_STARTED_AT = 0.0
+LEGACY_CRAWL_MAX_S = 7200
+
+
+def _chunked_audit_busy() -> list:
+    try:
+        import state
+        return [s["id"] for s in state.find_active_sessions()]
+    except Exception:
+        return []
+
+
+def _crawler_busy_error(active: list) -> dict:
+    return {"success": False, "reason": "crawler_busy",
+            "active_sessions": active,
+            "error": ("A chunked audit is using the crawler. Wait for it to finish, cancel it "
+                      "with librecrawl_audit_cancel, or use librecrawl_start_chunked_audit, "
+                      "which queues behind it.")}
+
+
+def _legacy_crawl_active() -> bool:
+    """True while a legacy tool owns the upstream crawler. The runner defers to it."""
+    if _LEGACY_CRAWL.locked():
+        return True
+    if time.time() - _LEGACY_STARTED_AT > LEGACY_CRAWL_MAX_S:
+        return False
+    try:
+        return _upstream_is_running(call("GET", "/api/crawl_status"))
+    except Exception:
+        return False
+
+
 def _ensure_crawler_ready() -> dict:
     """
     Make sure the upstream crawler is in a clean state before a new crawl.
@@ -1901,6 +1938,20 @@ def librecrawl_audit(url: str, max_pages: int = 500, confirm_unbounded: bool = F
     if gate:
         return gate
     url = url.strip()
+    active = _chunked_audit_busy()
+    if active:
+        return _crawler_busy_error(active)
+    if not _LEGACY_CRAWL.acquire(blocking=False):
+        return {"success": False, "reason": "crawler_busy",
+                "error": "Another librecrawl_audit is already running. Wait for it, or use "
+                         "librecrawl_start_chunked_audit, which queues."}
+    try:
+        return _librecrawl_audit_locked(url, max_pages)
+    finally:
+        _LEGACY_CRAWL.release()
+
+
+def _librecrawl_audit_locked(url: str, max_pages: int) -> dict:
     started_at = time.time()
     # Reset any stale crawler state so this run starts clean
     reset_info = _ensure_crawler_ready()
@@ -2173,9 +2224,21 @@ def librecrawl_start_crawl(url: str, max_pages: int = 500, confirm_unbounded: bo
     }
     # Always set maxUrls: leaving it out keeps whatever the previous run saved.
     settings["maxUrls"] = max_pages if max_pages > 0 else 5_000_000
-    _ensure_crawler_ready()
-    call("POST", "/api/save_settings", json=settings)
-    result   = call("POST", "/api/start_crawl", json={"url": url})
+    active = _chunked_audit_busy()
+    if active:
+        return _crawler_busy_error(active)
+    if not _LEGACY_CRAWL.acquire(blocking=False):
+        return {"success": False, "reason": "crawler_busy",
+                "error": "A librecrawl_audit is running. Wait for it to finish."}
+    try:
+        _ensure_crawler_ready()
+        call("POST", "/api/save_settings", json=settings)
+        result   = call("POST", "/api/start_crawl", json={"url": url})
+        if result.get("success"):
+            global _LEGACY_STARTED_AT
+            _LEGACY_STARTED_AT = time.time()
+    finally:
+        _LEGACY_CRAWL.release()
     crawl_id = result.get("crawl_id")
     return {
         "success": result.get("success"),
@@ -3351,9 +3414,9 @@ def librecrawl_start_chunked_audit(url: str, total_max_pages: int = 10000,
       total_max_pages     — your cap, or the sanity ceiling
 
     USE THIS for any audit on a site you don't already know is small. Plain
-    librecrawl_audit() still works (it wraps this with a 110s hard timeout
-    for backwards-compat), but for sites > a few hundred pages, polling
-    is the only way to avoid MCP client disconnects.
+    librecrawl_audit() still works, but it holds the call open until the crawl
+    ends (up to 2 hours), and most MCP clients time out long before that. For
+    anything bigger than a few dozen pages, polling is the only reliable way.
 
     Args:
         url:                Full URL (e.g. https://example.com).
@@ -4250,6 +4313,34 @@ def librecrawl_wipe_everything(confirm: bool = False) -> dict:
         "note":    ("MCP is now at zero-memory baseline." if ok else
                     "Wipe INCOMPLETE — see wiped.errors for what remains."),
     }
+
+
+def _offload_sync_tools() -> int:
+    """Run every sync tool in a worker thread.
+
+    FastMCP calls a sync tool directly on the event loop, so one long call
+    (librecrawl_audit polls for up to 2 hours) froze the whole server: no other
+    client could list tools, poll status or download a zip until it returned.
+    """
+    import functools
+
+    import anyio
+    n = 0
+    for tool in mcp._tool_manager.list_tools():
+        if tool.is_async:
+            continue
+        fn = tool.fn
+
+        async def runner(_fn=fn, **kwargs):
+            return await anyio.to_thread.run_sync(functools.partial(_fn, **kwargs))
+
+        tool.fn = runner
+        tool.is_async = True
+        n += 1
+    return n
+
+
+_offload_sync_tools()
 
 
 if __name__ == "__main__":

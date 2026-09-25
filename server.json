@@ -3,7 +3,7 @@
   "name": "io.github.adityaarsharma/librecrawl-technical-seo-audit-mcp",
   "title": "Librecrawl — Technical SEO Audit MCP Server",
   "description": "Self-hosted technical SEO audit MCP. 50+ checks, WAF detection, ephemeral. Built on LibreCrawl.",
-  "version": "2.3.3",
+  "version": "2.3.4",
   "websiteUrl": "https://github.com/adityaarsharma/librecrawl-technical-seo-audit-mcp",
   "repository": {
     "url": "https://github.com/adityaarsharma/librecrawl-technical-seo-audit-mcp",
