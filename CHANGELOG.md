@@ -1,5 +1,48 @@
 # Changelog
 
+## [2.3.0] — 2026-09-25
+### Security
+- **SSRF guard on every outbound fetch** (`url_guard.py`). Crawl seeds, robots and sitemap
+  probes, schema extraction, external-link checks, sitemap fill, content audit and extended
+  checks now accept only http/https and refuse loopback, private, link-local (cloud metadata)
+  and docker-internal targets, including decimal and hex IP spellings. Redirects are re-checked
+  hop by hop. `LIBRECRAWL_ALLOW_PRIVATE_TARGETS=1` opts in for intranet audits.
+- `report_content` and the GSC merge path check use `Path.is_relative_to`, closing a
+  sibling-directory prefix bypass (`/reports-evil/...`).
+### Fixed
+- **Cleanup actually deletes the upstream crawl.** Cleanup now goes through LibreCrawl's REST
+  delete, and the bundled upstream patch deletes its child tables too, so no crawled pages,
+  links, issues or queue rows survive. The old path wrote to a read-only mount and failed silently.
+- **Watchdog purged unrelated rows.** Its fallback SQL matched `crawl_id = ? OR id = ?` on child
+  tables; it now matches `crawl_id` only and prefers the REST delete.
+- Response times were always blank: the export asked for a field upstream does not have.
+  Now read from `response_time` (ms).
+- The homepage was counted as an orphan page. The seed is excluded everywhere orphans are counted.
+- A missing sitemap (404/410) no longer marks a strict audit as failed; it is reported as a finding.
+  Auto-purge now runs whether or not the strict audit passed.
+- Off-site URLs (other hosts listed in a sitemap, off-site redirect targets) no longer enter the
+  crawl results or the sitemap reconciliation.
+- A seed that never answered (status 0) is reported as a failure, not an audit with zero issues.
+- Sitemap fill could overshoot `total_max_pages`; it now fills only the remaining budget.
+- Reports derive the site from the crawl's own base URL instead of the first exported page.
+- `filter_issues` filters locally by substring across url, type, category, issue and details
+  (upstream's endpoint ignored the patterns). `get_status` counts the real issue list.
+- `schema_audit` separates fetch errors from "no schema" and marks the audit incomplete.
+- PDF: emoji render as `[OK]`/`[WARN]`/`[FAIL]` labels instead of empty boxes, the page count
+  is correct, and the footer is configurable via `LIBRECRAWL_PDF_FOOTER`.
+- PageSpeed tools work without an API key (keyless quota), with a 60s timeout and a clear
+  `rate_limited` reason on 429.
+- Legacy `librecrawl_audit`, `librecrawl_start_crawl` and `librecrawl_full_audit_strict` take
+  `max_pages` (default 500) and refuse an unbounded crawl unless `confirm_unbounded=True`.
+### Added
+- **`librecrawl_audit_confirm_saved(session_id, sha256)`.** The zip is no longer deleted the
+  moment it is returned. The client saves it, sends back the sha256 of the saved bytes, and only
+  a match wipes the session, artifacts and upstream crawl. A mismatch deletes nothing.
+- `tests/`: 53 pytest cases for the guard, export mapping, orphan logic, sitemap strictness,
+  entry-point gates, local issue filtering and the confirm-then-wipe flow.
+### Changed
+- `mcp` pinned to `>=1.2.0,<2`.
+
 ## [2.2.0] — 2026-07-14
 ### Added
 - **One-command Docker deploy.** New `docker-compose.yml` brings up the LibreCrawl

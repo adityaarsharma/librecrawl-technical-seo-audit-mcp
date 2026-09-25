@@ -198,14 +198,14 @@ for i in $(seq 1 18); do
 done
 
 # ── Step 4: MCP server ───────────────────────────────────────────────────────
-info "Step 4/5 — Installing LibreCrawl MCP server (v2.0.3 — 37 tools)..."
+info "Step 4/5 — Installing LibreCrawl MCP server (v2.3.0 — 38 tools)..."
 
 MCP_DIR="${INSTALL_DIR}/mcp-server"
 mkdir -p "${MCP_DIR}"
 
 # Download all 10 Python modules that make up the v2.0.3 MCP wrapper.
 # server.py is the FastMCP entrypoint; the others are imported by it.
-# Server-side instructions + ephemeral mode + 37 tools all need these files.
+# Server-side instructions + ephemeral mode + 38 tools all need these files.
 info "Downloading MCP server modules from GitHub (10 files)..."
 BASE_URL="https://raw.githubusercontent.com/adityaarsharma/librecrawl-technical-seo-audit-mcp/main"
 for f in server.py state.py libreclient.py runner.py external_links.py \
@@ -508,7 +508,7 @@ STUDIOJSON
   echo ""
 fi
 
-echo -e "  ${BOLD}37 tools available (v2.0.3):${NC}"
+echo -e "  ${BOLD}38 tools available (v2.3.0):${NC}"
 echo -e "    Chunked audit    : librecrawl_start_chunked_audit (USE THIS),"
 echo -e "                       librecrawl_audit_status, librecrawl_audit_zip,"
 echo -e "                       librecrawl_audit_artifacts,"

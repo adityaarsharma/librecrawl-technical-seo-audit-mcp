@@ -1,6 +1,6 @@
 ---
 name: librecrawl-audit
-description: Run a full technical SEO audit on any website via the librecrawl-technical-seo-audit-mcp MCP server. Use when the user asks for "audit X site", "SEO check", "broken link sweep", "Screaming Frog this site", "schema validation", "site health report", "core web vitals scan", "find missing meta / H1 / canonical", "sitemap audit", "external link check", or any phrase indicating they want a comprehensive technical SEO audit on a live URL. Returns a PDF + 7 sidecar CSVs as a zip. Server is ephemeral — once you download the zip, the audit is gone from the server.
+description: Run a full technical SEO audit on any website via the librecrawl-technical-seo-audit-mcp MCP server. Use when the user asks for "audit X site", "SEO check", "broken link sweep", "Screaming Frog this site", "schema validation", "site health report", "core web vitals scan", "find missing meta / H1 / canonical", "sitemap audit", "external link check", or any phrase indicating they want a comprehensive technical SEO audit on a live URL. Returns a PDF + 7 sidecar CSVs as a zip. Server is ephemeral: once you save the zip and confirm its hash, the audit is gone from the server.
 ---
 
 # ⚠️ MANDATORY RULES — read first, no exceptions
@@ -13,26 +13,32 @@ After `librecrawl_audit_zip` returns, you MUST decode the `content_base64` and w
 
 Pseudo-code your runtime should execute:
 ```python
-import base64
-local_path = filename   # use the filename field from the response, e.g. "example.com-1780572742.zip"
+import base64, hashlib
+data = base64.b64decode(content_base64)
+local_path = filename   # the filename field from the response, e.g. "example.com-1a2b3c4d.zip"
 with open(local_path, "wb") as f:
-    f.write(base64.b64decode(content_base64))
+    f.write(data)
+local_sha = hashlib.sha256(data).hexdigest()
 ```
 
 You report the LOCAL path back to the user. **NEVER** report the `zip_path` field from the response as the deliverable — that path is on the **remote server**, not on the operator's local machine. The user cannot open it.
 
-## Rule 2: ALWAYS use `auto_cleanup=True`
+## Rule 2: ALWAYS confirm the save
 
-Default and only sane choice. The user contract is: server forgets the audit the moment they have the zip. Do NOT pass `auto_cleanup=False` — it leaves audit data sitting on the remote server. If a user explicitly says "keep the data on the server", confirm twice and only then opt out.
+After writing the file, call `librecrawl_audit_confirm_saved(session_id, sha256=local_sha)` with the hash of the bytes you wrote. The server compares it with its own copy and only then deletes the session, artifacts, zip and upstream crawl record. A mismatch deletes nothing, so a failed save never loses the audit. Unconfirmed zips are swept after an hour.
+
+`auto_cleanup=True` on `librecrawl_audit_zip` wipes in the same call. Use it only when your client cannot write files and call back.
 
 ## Rule 3: After saving, verify + tell the user the LOCAL path
 
 Pattern your final response on this:
 
-> ✅ Audit done.
-> Saved locally: `./example.com-1780572742.zip` (320 KB · sha256 verified)
-> Contents: SUMMARY.txt + PDF report + 7 CSVs (per-page · sitemap-recon · external-links · content-audit · extended-checks).
-> Server forgot the session — it's not stored anywhere remote.
+> Audit done.
+> Saved locally: `./example.com-1a2b3c4d.zip` (320 KB, sha256 confirmed by the server)
+> Contents: SUMMARY.txt + PDF report + CSVs (per-page · sitemap-recon · external-links · content-audit · extended-checks).
+> Server cleanup: passed.
+
+If `confirm_saved` returns `success: false`, say which cleanup step failed (see its `cleanup` field) instead of claiming the server forgot everything.
 
 Do **not** say:
 > ❌ "Zip created: /home/<user>/librecrawl-reports/example.com-XXXX.zip"
@@ -43,7 +49,7 @@ That path is on the server. Useless to the user.
 
 # librecrawl-audit
 
-Drive the librecrawl-technical-seo-audit-mcp MCP server to produce a complete technical SEO audit of any website. The MCP exposes 37 tools at `mcp__librecrawl-posi__*` (or whatever the local connector name is in the user's config).
+Drive the librecrawl-technical-seo-audit-mcp MCP server to produce a complete technical SEO audit of any website. The MCP exposes 38 tools at `mcp__librecrawl-posi__*` (or whatever the local connector name is in the user's config).
 
 ## When to use this skill
 
@@ -99,38 +105,32 @@ Poll every 20-30 seconds. The runner does its own background work; you do NOT ne
 
 When `status == "done"`, proceed to step 3.
 
-### 3. Download the zip + auto-clean the server
+### 3. Download the zip, save it, confirm
 
 ```text
-librecrawl_audit_zip(session_id, auto_cleanup=True) → {
-    filename: "<domain>-<unix-ts>.zip",
+librecrawl_audit_zip(session_id) → {
+    filename: "<domain>-<session8>.zip",
     size_bytes: int,
-    file_count: 8,                   # SUMMARY.txt + 7 artifacts
+    file_count: int,
+    files: [{kind, name, bytes}, ...],
+    missing: [...],                  # artifacts that could not be included
     sha256: "...",
-    content_base64: "...",          # decode + save locally
-    zip_path: "/path/to/zip",        # filesystem alternative
-    zip_path_persistent: bool,       # False when auto_cleanup=True (zip unlinked after response)
-    cleanup: {
-        session_rows: { events, artifacts, chunks, sessions },
-        files_deleted: int,
-        upstream: { crawl_issues, crawl_links, crawled_urls, crawls }
-    },
-    files: [{kind, name, bytes}, ...]
+    content_base64: "...",           # decode + save locally
+    zip_path: "...",                 # REMOTE path, forensics only
+    next_step: "..."
 }
 ```
 
-`auto_cleanup=True` is mandatory (see Rule 2). The server deletes every trace of the audit after this call returns. The base64 zip in the response IS the only copy.
+Save it (Rule 1), then:
 
-**Save to disk IMMEDIATELY** before reporting back to the user — this is Rule 1, non-negotiable:
-```python
-import base64
-local_path = filename   # exactly the response.filename field
-with open(local_path, "wb") as f:
-    f.write(base64.b64decode(content_base64))
-print(f"Saved locally: {local_path}")
+```text
+librecrawl_audit_confirm_saved(session_id, sha256=local_sha) → {
+    success: bool,                   # True only if every cleanup step passed
+    cleanup: { files_deleted, file_errors, session_rows, upstream, zip_file_deleted, ok }
+}
 ```
 
-⚠️ The response also includes a `zip_path` field — that path is on the **remote server**, NOT on the operator's machine. It's there for forensics only. DO NOT report it as the deliverable. The local file (saved by the snippet above) is what the user opens.
+⚠️ `zip_path` is on the **remote server**, not the operator's machine. Never report it as the deliverable.
 
 ### 4. Help the user open / inspect the zip
 
@@ -151,7 +151,7 @@ When the user asks "show me the broken pages" or "what schema errors do I have",
 
 ### 5. Done
 
-The server is back to zero state. No follow-up cleanup needed. If the user wants a fresh audit later, start over from step 1.
+After a successful `confirm_saved` the server holds nothing for this audit. For a fresh audit, start over from step 1.
 
 ## Common patterns
 
@@ -161,7 +161,7 @@ The server is back to zero state. No follow-up cleanup needed. If the user wants
 1. librecrawl_start_chunked_audit(url=X, total_max_pages=10000)
 2. Poll librecrawl_audit_status until done
 3. librecrawl_audit_zip(session_id)
-4. Save zip locally
+4. Save zip locally, then librecrawl_audit_confirm_saved(session_id, sha256)
 5. Read per-page.csv, filter status_4xx == 1 OR status_5xx == 1, show table
 6. Read external-links.csv, filter status_class IN ("not_found", "forbidden", "server_error_5xx", "timeout", "dns_error"), show table
 ```
@@ -171,13 +171,13 @@ The server is back to zero state. No follow-up cleanup needed. If the user wants
 ```text
 1. Run chunked audit first (skill above)
 2. After download: librecrawl_schema_validate(crawl_id) — wait, this needs an alive session.
-   PREFERRED: do this BEFORE auto_cleanup. Pass auto_cleanup=False to librecrawl_audit_zip,
-   call schema_validate, then librecrawl_wipe_everything later.
+   PREFERRED: run it after librecrawl_audit_zip but BEFORE confirm_saved, while the
+   upstream crawl still exists, then confirm.
 ```
 
 ### "Just check external links on this site"
 
-Same chunked workflow — the `.external-links.csv` sidecar covers it. Don't run `librecrawl_external_links_audit` standalone unless the user has a crawl_id from a recent fresh chunked audit and `auto_cleanup` hasn't fired yet.
+Same chunked workflow — the `.external-links.csv` sidecar covers it. Don't run `librecrawl_external_links_audit` standalone unless the user has a crawl_id from a chunked audit that has not been confirmed yet.
 
 ### "Big site — like 50,000 pages"
 
@@ -208,9 +208,9 @@ The server is ephemeral — emphasise that the zip is the only copy.
 - ❌ Don't call `librecrawl_audit_zip` before status is `done` — returns an error.
 - ❌ Don't store the base64 in your conversation buffer for analysis. Save to disk, then read from disk.
 - ❌ Don't suggest the user rerun the audit just to look at different findings — every CSV is in the zip already.
-- ❌ Don't manually call `librecrawl_brain_purge_audit` — `librecrawl_audit_zip(auto_cleanup=True)` does this for you.
+- ❌ Don't manually call `librecrawl_brain_purge_audit`: `librecrawl_audit_confirm_saved` does this for you.
 
-## MCP tool reference (37 tools)
+## MCP tool reference (38 tools)
 
 Quick map of all tools the librecrawl MCP exposes. Most flows use only the **highlighted 4**.
 

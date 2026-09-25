@@ -34,3 +34,27 @@ else:
     content = content.replace(old2, new2, 1)
     open(path, "w", encoding="utf-8").write(content)
     print("Session persistence patch applied")
+
+# ── Patch 2: delete_crawl must remove child rows ────────────────────────────
+# Upstream's delete_crawl() runs `DELETE FROM crawls WHERE id = ?` and relies
+# on ON DELETE CASCADE, but never enables `PRAGMA foreign_keys`, so SQLite
+# ignores the cascade and every crawled page, link and issue of a "deleted"
+# crawl stays on disk. The MCP promises ephemeral audits, so delete the child
+# tables explicitly.
+import os
+
+crawl_db = os.path.join(os.path.dirname(os.path.abspath(path)), "src", "crawl_db.py")
+db_src = open(crawl_db, encoding="utf-8", newline="").read()  # keep upstream CRLF
+
+old3 = """            cursor.execute('DELETE FROM crawls WHERE id = ?', (crawl_id,))"""
+new3 = """            for _child in ('crawl_queue', 'crawl_issues', 'crawl_links', 'crawled_urls'):
+                cursor.execute(f'DELETE FROM {_child} WHERE crawl_id = ?', (crawl_id,))
+            cursor.execute('DELETE FROM crawls WHERE id = ?', (crawl_id,))"""
+
+if "for _child in ('crawl_queue'" in db_src:
+    print("delete_crawl child-row patch already applied — skipping")
+elif old3 not in db_src:
+    sys.exit("delete_crawl child-row patch: upstream code changed, patch did not apply")
+else:
+    open(crawl_db, "w", encoding="utf-8", newline="").write(db_src.replace(old3, new3, 1))
+    print("delete_crawl child-row patch applied")

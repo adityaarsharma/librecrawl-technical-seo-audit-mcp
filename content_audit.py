@@ -43,6 +43,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from url_guard import guarded_async_client
+
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -288,7 +290,7 @@ async def _fetch_one(url: str, client: httpx.AsyncClient,
 
 async def _fetch_all(urls: list, max_workers: int, timeout_s: float) -> list:
     sem = asyncio.Semaphore(max_workers)
-    async with httpx.AsyncClient(http2=False, verify=True) as client:
+    async with guarded_async_client(http2=False, verify=True) as client:
         async def _bounded(u):
             async with sem:
                 return await _fetch_one(u, client, timeout_s)

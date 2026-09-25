@@ -6,7 +6,7 @@ The system is two processes: a thin **MCP wrapper** your AI assistant talks to, 
 flowchart TD
     A["MCP client — Claude / Cursor / Codex / Windsurf"]
     A -->|streamable HTTP or stdio| B
-    subgraph MCP["server.py — FastMCP, 37 tools"]
+    subgraph MCP["server.py — FastMCP, 38 tools"]
         direction TB
         B["runner.py — background worker + AIMD controller"]
         C["state.py — SQLite WAL session state"]
@@ -24,7 +24,7 @@ flowchart TD
 ## Components
 
 ### `server.py` — the MCP surface
-FastMCP application registering all 37 tools. Owns the authenticated HTTP client to LibreCrawl (`get_client()` logs in once and reuses the session cookie) and the base URL (`LIBRECRAWL_URL`, or `http://127.0.0.1:<LIBRECRAWL_PORT>`). Serves either streamable HTTP (`MCP_HOST:MCP_PORT/mcp`) or stdio, chosen by `MCP_TRANSPORT`.
+FastMCP application registering all 38 tools. Owns the authenticated HTTP client to LibreCrawl (`get_client()` logs in once and reuses the session cookie) and the base URL (`LIBRECRAWL_URL`, or `http://127.0.0.1:<LIBRECRAWL_PORT>`). Serves either streamable HTTP (`MCP_HOST:MCP_PORT/mcp`) or stdio, chosen by `MCP_TRANSPORT`.
 
 ### `runner.py` — background worker + AIMD controller
 Chunked audits run here on a background worker thread so the MCP call returns a `session_id` in under 2 seconds instead of blocking. The **AIMD controller** (Additive-Increase/Multiplicative-Decrease, the same idea as TCP congestion control) tunes crawl delay live: error rate over ~10% halves the chunk and doubles the delay; p95 latency over ~1.5× target stretches the delay; clean signals ease off additively. It respects the `robots.txt` `Crawl-Delay` floor. This is what keeps big, heavy origins healthy without manual tuning.
@@ -50,4 +50,4 @@ LibreCrawl reads its `session_id` before the crawler that creates it is initiali
 
 ## Ephemeral by design
 
-When you download an audit with `auto_cleanup=True`, the server deletes the session row, every artifact file on disk, and the upstream LibreCrawl crawl record. Per-audit server footprint after cleanup: 0 bytes, 0 rows. Your downloaded zip is the only remaining copy.
+After you save an audit and call `librecrawl_audit_confirm_saved` with the zip's sha256, the server deletes the session rows, every artifact file, the zip and the upstream LibreCrawl crawl record (through LibreCrawl's own delete API, including its child tables). A hash mismatch deletes nothing. Unconfirmed zips are swept after an hour. Your downloaded zip is then the only copy.

@@ -10,7 +10,7 @@
 
 Run a complete on-site SEO audit on any website — straight from Claude, Cursor, Codex, or any Model Context Protocol (MCP) client. **Unlimited pages · 50+ checks · PDF + CSVs · MIT-licensed · self-hosted · ephemeral by design.**
 
-Built on the open-source [**LibreCrawl**](https://github.com/PhialsBasement/LibreCrawl) engine, exposed through 37 MCP tools your AI assistant calls directly.
+Built on the open-source [**LibreCrawl**](https://github.com/PhialsBasement/LibreCrawl) engine, exposed through 38 MCP tools your AI assistant calls directly.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
 [![MCP Compatible](https://img.shields.io/badge/MCP-Compatible-orange?style=for-the-badge&logo=anthropic)](https://modelcontextprotocol.io)
@@ -45,7 +45,7 @@ Built on the open-source [**LibreCrawl**](https://github.com/PhialsBasement/Libr
 - [Your first audit](#-your-first-audit)
 - [How it works](#-how-it-works) · [Architecture](#-architecture)
 - [Configuration](#-configuration)
-- [37 MCP tools](#-37-mcp-tools)
+- [38 MCP tools](#-38-mcp-tools)
 - [Documentation](#-documentation)
 - [Roadmap](#-roadmap)
 - [License & credits](#-license--trademarks)
@@ -105,7 +105,7 @@ There are great desktop SEO crawlers (you know the ones). There are great cloud 
 
 ### ⚡ It runs **inside your AI assistant**
 
-37 MCP tools your agent calls directly. No GUI app to babysit, no SaaS dashboard to log into, no CSV exports to upload to ChatGPT. **You just ask.**
+38 MCP tools your agent calls directly. No GUI app to babysit, no SaaS dashboard to log into, no CSV exports to upload to ChatGPT. **You just ask.**
 
 ### 🚀 Chunked-progressive crawler that **never times out**
 
@@ -344,10 +344,12 @@ Agent: → librecrawl_start_chunked_audit(url=..., total_max_pages=10000)
          status: crawling, pages_done: 312, last chunk p95: 480ms, err_rate: 0%
          status: done,     pages_done: 534, artifacts_ready: true
 
-       → librecrawl_audit_zip(session_id, auto_cleanup=True)
-         returns base64 zip (8 files, 320 KB)
-         SAVES LOCALLY as example.com-1780572742.zip
-         Server wiped: session_rows=4, files=8, upstream_crawl=1
+       → librecrawl_audit_zip(session_id)
+         returns base64 zip (8 files, 320 KB) + sha256
+         SAVES LOCALLY as example.com-1a2b3c4d.zip
+
+       → librecrawl_audit_confirm_saved(session_id, sha256=<hash of saved file>)
+         hash matches, so the server wipes: session rows, files, zip, upstream crawl
 
 You:   Show me broken pages + broken external links
 
@@ -356,7 +358,7 @@ Agent: → unzips, reads per-page.csv (filters status_4xx OR status_5xx)
        → prints both tables
 ```
 
-**Local zip is the only copy.** Server is back to zero state.
+**Local zip is the only copy.** The server deletes nothing until the agent proves the save with a matching sha256, and unconfirmed zips are swept after an hour.
 
 ---
 
@@ -396,9 +398,12 @@ sequenceDiagram
         MCP-->>Agent: crawling · pages_done · p95 latency · err_rate
     end
     MCP-->>Agent: status: done · artifacts_ready
-    Agent->>MCP: librecrawl_audit_zip(session_id, auto_cleanup=True)
-    MCP-->>Agent: base64 zip — branded PDF + 7 CSVs
-    Agent-->>You: saved locally · server wiped to 0 bytes, 0 rows
+    Agent->>MCP: librecrawl_audit_zip(session_id)
+    MCP-->>Agent: base64 zip + sha256 (branded PDF + 7 CSVs)
+    Agent->>Agent: save locally, hash the saved bytes
+    Agent->>MCP: librecrawl_audit_confirm_saved(session_id, sha256)
+    MCP-->>Agent: hash matches, server wiped, per-step cleanup result
+    Agent-->>You: saved locally, cleanup passed
 ```
 
 ---
@@ -411,7 +416,7 @@ Two processes: a thin MCP wrapper your agent talks to, and the LibreCrawl engine
 flowchart TD
     A["🖥️ MCP client<br/>Claude Code · Desktop · Cursor · Codex · Windsurf"]
     A -->|streamable HTTP or stdio| B
-    subgraph MCP["🕷️ librecrawl-technical-seo-audit-mcp — server.py (FastMCP · 37 tools)"]
+    subgraph MCP["🕷️ librecrawl-technical-seo-audit-mcp — server.py (FastMCP · 38 tools)"]
         direction TB
         B["runner.py<br/>background worker thread + AIMD controller"]
         C["state.py<br/>SQLite WAL — session state"]
@@ -441,19 +446,21 @@ All environment variables are optional — the defaults just work. Set them via 
 | `MCP_TRANSPORT` | `http` | `http` (streamable) or `stdio` |
 | `REPORTS_DIR` | `~/librecrawl-reports` | Where audit zips land |
 | `LIBRECRAWL_UPSTREAM_DB` | `~/.librecrawl/upstream/users.db` | LibreCrawl's SQLite, for orphan/cleanup checks (degrades gracefully if absent) |
-| `PAGESPEED_API_KEY` | unset | Optional — enables `librecrawl_pagespeed*` (raises PSI limits) |
+| `PAGESPEED_API_KEY` | unset | Optional. `librecrawl_pagespeed*` works without it on Google's low shared quota; a key raises the limit |
+| `LIBRECRAWL_ALLOW_PRIVATE_TARGETS` | unset | Set to `1` to audit intranet or localhost sites. By default every fetch refuses private, loopback and cloud-metadata addresses, including on redirects |
+| `LIBRECRAWL_PDF_FOOTER` | author credit | Replaces the PDF footer text |
 
 📖 Full reference, per-client config, and transport details: **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
 
 ---
 
-## 🛠️ 37 MCP tools
+## 🛠️ 38 MCP tools
 
 <details>
 <summary><strong>Expand the full tool reference</strong></summary>
 
 **Chunked audit (95% of work):**
-- `librecrawl_start_chunked_audit` · `librecrawl_audit_status` · `librecrawl_audit_zip`
+- `librecrawl_start_chunked_audit` · `librecrawl_audit_status` · `librecrawl_audit_zip` · `librecrawl_audit_confirm_saved`
 - `librecrawl_audit_pause` · `librecrawl_audit_resume` · `librecrawl_audit_cancel` · `librecrawl_audit_force_advance`
 - `librecrawl_audit_artifacts` · `librecrawl_audit_pdf` · `librecrawl_report_content`
 
@@ -484,7 +491,7 @@ Deeper guides live in [`docs/`](docs/):
 |---|---|
 | **[Getting Started](docs/GETTING-STARTED.md)** | Install every way (one-liner · Docker · manual), per-client config for Claude Code/Desktop, Cursor, Windsurf, Codex, Continue.dev, and your first audit end-to-end |
 | **[Configuration](docs/CONFIGURATION.md)** | Every environment variable, HTTP vs stdio transport, ports, reports directory, PageSpeed key |
-| **[Tools Reference](docs/TOOLS.md)** | All 37 MCP tools — signatures, arguments, when to use each |
+| **[Tools Reference](docs/TOOLS.md)** | All 38 MCP tools — signatures, arguments, when to use each |
 | **[Architecture](docs/ARCHITECTURE.md)** | How the wrapper, background worker, AIMD controller, and LibreCrawl backend fit together |
 | **[Troubleshooting](docs/TROUBLESHOOTING.md)** | Common errors and fixes — backend unreachable, empty audits, PDF/WeasyPrint, Docker health, big-site tuning |
 

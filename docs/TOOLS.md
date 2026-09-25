@@ -1,6 +1,6 @@
 # Tools Reference
 
-The server exposes **37 MCP tools**. In normal use you never call these by hand — your AI assistant picks them from your plain-language request. This reference is for understanding what's available and for power users scripting against the MCP directly.
+The server exposes **38 MCP tools**. In normal use you never call these by hand — your AI assistant picks them from your plain-language request. This reference is for understanding what's available and for power users scripting against the MCP directly.
 
 > Each tool's exact input schema is advertised over MCP (your client can list it). Signatures below show the arguments you'll actually reach for; optional/advanced parameters are summarized in prose.
 
@@ -12,7 +12,8 @@ This is the modern flow: start → poll → zip. It never times out and survives
 |---|---|---|
 | `librecrawl_start_chunked_audit` | `(url, total_max_pages=10000)` | Kicks off a full background audit. Returns a `session_id` in under 2 seconds. `total_max_pages=0` means unlimited. |
 | `librecrawl_audit_status` | `(session_id)` | Poll this every ~25s. Reports `status` (queued/crawling/done), `pages_done`, `current_delay_ms`, chunk p95 latency, error rate, and `artifacts_ready`. |
-| `librecrawl_audit_zip` | `(session_id, auto_cleanup=True)` | Returns the finished audit as a base64 zip (PDF + 7 CSVs). With `auto_cleanup=True` the server then wipes the session, artifact files, and upstream crawl record. |
+| `librecrawl_audit_zip` | `(session_id, auto_cleanup=False)` | Returns the finished audit as a base64 zip (PDF + 7 CSVs) plus its sha256. Nothing is deleted yet unless `auto_cleanup=True`. |
+| `librecrawl_audit_confirm_saved` | `(session_id, sha256)` | Call after saving the zip, with the hash of the saved bytes. On a match the server wipes the session, artifacts, zip and upstream crawl record; on a mismatch it deletes nothing. |
 | `librecrawl_audit_pause` | `(session_id)` | Pause an in-progress crawl. |
 | `librecrawl_audit_resume` | `(session_id)` | Resume a paused crawl. |
 | `librecrawl_audit_cancel` | `(session_id)` | Stop and discard an in-progress audit. |

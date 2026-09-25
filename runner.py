@@ -223,7 +223,7 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     from server import (_build_report, _site_check, _write_per_page_csv,
                         _write_sitemap_recon_csv, _compute_sitemap_reconciliation,
                         _build_checks_manifest, _compute_crawl_completeness,
-                        REPORTS_DIR)
+                        _safe_domain, _site_hosts, _on_site, REPORTS_DIR)
 
     sess = state.get_session(sid)
     url = sess["url"]
@@ -241,9 +241,25 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
         state.set_status(sid, "failed", "No pages exported")
         return
 
+    # Off-site pages (a redirect or a followed link to another host) are not
+    # part of this site's audit.
+    site_hosts = _site_hosts(url, pages)
+    offsite = [p for p in pages if not _on_site(p.get("url", ""), site_hosts)]
+    if offsite:
+        pages = [p for p in pages if _on_site(p.get("url", ""), site_hosts)]
+        state.log_event(sid, "offsite_pages_dropped",
+                        {"count": len(offsite), "sample": [p.get("url") for p in offsite[:5]]})
+
+    # Upstream reports a "successful" crawl of an unreachable seed as one page
+    # with status 0. That is a failed audit, not a clean one.
+    if not any(int(p.get("status_code") or 0) > 0 for p in pages):
+        state.update_session(sid, incomplete_reasons="seed_unreachable")
+        state.set_status(sid, "failed", "Seed unreachable: no page returned an HTTP status")
+        return
+
     site_data = _site_check(url)
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    domain = url.replace("https://", "").replace("http://", "").rstrip("/").split("/")[0]
+    domain = _safe_domain(url)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M")
 
     # ── v1.6 sitemap-orphan fill ─────────────────────────────────────────────
@@ -262,12 +278,16 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
     # runaway safety ceiling. No silent page-dropping: anyone who runs the tool
     # gets every page, every text, every link. Politeness (low concurrency +
     # delay) keeps it safe on heavy sites; it just takes longer.
+    # The fill tops up to total_max_pages, it never adds another full budget.
     _raw_cap = int(settings.get("sitemap_fill_cap", 0))
     _ceiling = sess["total_max_pages"] if sess["total_max_pages"] > 0 else 100_000
-    fill_cap = _raw_cap if _raw_cap > 0 else _ceiling
+    _remaining = max(0, _ceiling - len(pages))
+    fill_cap = min(_raw_cap, _remaining) if _raw_cap > 0 else _remaining
+    # Sitemaps can list other hosts (CDNs, sister sites). Only fill this site's URLs.
+    _sm_only = [u for u in pre_recon.get("sitemap_only", []) if _on_site(u, site_hosts)]
     fill_summary = {"attempted": 0, "skipped_disabled": not fill_enabled}
 
-    if fill_enabled and pre_recon.get("sitemap_only_count", 0) > 0:
+    if fill_enabled and _sm_only and fill_cap > 0:
         try:
             import sitemap_fill
             # v2.0.9: Screaming-Frog-grade politeness for heavy sites.
@@ -277,7 +297,7 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
             # concurrency (4 workers, SF's 2-5 range) + 500ms jittered
             # per-request delay. All tunable per audit via settings.
             fill_result = sitemap_fill.fill_sitemap_orphans(
-                pre_recon.get("sitemap_only", []),
+                _sm_only,
                 max_workers=int(settings.get("fetch_workers", 4)),
                 timeout_seconds=float(settings.get("fetch_timeout_s", 25.0)),
                 cap=fill_cap,
@@ -297,7 +317,7 @@ def _finalize_session(sid: str, upstream_crawl_id: int, last_delay_ms: int,
             state.log_event(sid, "sitemap_fill_failed", str(e))
             fill_summary = {"attempted": 0, "error": str(e)}
     elif fill_enabled:
-        fill_summary["reason"] = "no_orphans"
+        fill_summary["reason"] = "no_orphans" if not _sm_only else "page_budget_spent"
 
     # ── v1.6.1: compute completeness FIRST so the report banner can use it ──
     # Re-compute recon AFTER sitemap_fill so the CSV + completeness reflect
@@ -555,6 +575,11 @@ def enqueue_session(url: str, total_max_pages: int = 10_000,
                     confirm_unbounded: bool = False,
                     extra_settings: dict | None = None) -> dict:
     """Create a session row and wake the runner. Returns the new session dict."""
+    from server import _seed_gate
+    gate = _seed_gate(url)
+    if gate:
+        return gate
+    url = url.strip()
     if total_max_pages == 0 and not confirm_unbounded:
         return {
             "success": False,

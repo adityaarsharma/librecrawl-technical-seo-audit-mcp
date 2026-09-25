@@ -117,8 +117,10 @@ Agent: → librecrawl_start_chunked_audit(url="https://example.com", total_max_p
          crawling · pages_done: 47 · current_delay_ms: 250
          crawling · pages_done: 312 · p95: 480ms · err_rate: 0%
          done · pages_done: 534 · artifacts_ready: true
-       → librecrawl_audit_zip(session_id, auto_cleanup=True)
-         saves example.com-<timestamp>.zip locally, wipes the server
+       → librecrawl_audit_zip(session_id)
+         saves example.com-<id>.zip locally
+       → librecrawl_audit_confirm_saved(session_id, sha256)
+         hash matches, server wipes its copy
 
 You:   Show me broken pages + broken external links + hreflang errors
 Agent: → unzips, filters per-page.csv and external-links.csv, prints the tables
@@ -135,6 +137,6 @@ Each audit produces a single zip (8 files): `SUMMARY.txt`, a branded PDF, its Ma
 - **Docker:** written to `./reports` in the repo.
 - **Manual / installer:** written to `REPORTS_DIR` (default `~/librecrawl-reports`).
 
-The audit is **ephemeral** — once the zip is downloaded with `auto_cleanup=True`, the server deletes the session, the artifact files, and the upstream crawl record. Your local zip is the only copy.
+The audit is **ephemeral**: once the agent saves the zip and confirms its sha256, the server deletes the session, the artifact files, the zip and the upstream crawl record. Your local zip is the only copy.
 
 Stuck? See **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)**.
