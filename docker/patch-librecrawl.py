@@ -11,7 +11,7 @@ Idempotent: safe to run more than once. Usage: python3 patch-librecrawl.py main.
 import sys
 
 path = sys.argv[1] if len(sys.argv) > 1 else "main.py"
-content = open(path, encoding="utf-8").read()
+content = open(path, encoding="utf-8", newline="").read()  # keep upstream CRLF
 
 old = """    user_id = session.get('user_id')
     session_id = session.get('session_id')
@@ -27,12 +27,18 @@ new2 = """    # Get or create crawler for this session (also initialises session
     crawler = get_or_create_crawler()
     session_id = session.get('session_id')  # Must read AFTER get_or_create_crawler sets it"""
 
+if "\r\n" in content:
+    old, new, old2, new2 = (t.replace("\n", "\r\n") for t in (old, new, old2, new2))
+
 if old not in content:
     print("Session persistence patch already applied or not needed — skipping")
+elif old2 not in content:
+    # Removing the early read without re-adding it later would leave session_id undefined.
+    sys.exit("Session persistence patch: upstream code changed, patch did not apply")
 else:
     content = content.replace(old, new, 1)
     content = content.replace(old2, new2, 1)
-    open(path, "w", encoding="utf-8").write(content)
+    open(path, "w", encoding="utf-8", newline="").write(content)
     print("Session persistence patch applied")
 
 # ── Patch 2: delete_crawl must remove child rows ────────────────────────────
@@ -50,6 +56,9 @@ old3 = """            cursor.execute('DELETE FROM crawls WHERE id = ?', (crawl_i
 new3 = """            for _child in ('crawl_queue', 'crawl_issues', 'crawl_links', 'crawled_urls'):
                 cursor.execute(f'DELETE FROM {_child} WHERE crawl_id = ?', (crawl_id,))
             cursor.execute('DELETE FROM crawls WHERE id = ?', (crawl_id,))"""
+
+if "\r\n" in db_src:
+    new3 = new3.replace("\n", "\r\n")
 
 if "for _child in ('crawl_queue'" in db_src:
     print("delete_crawl child-row patch already applied — skipping")
