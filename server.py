@@ -909,7 +909,10 @@ def _build_report(pages: list, base_url: str, crawl_id: int,
         lines.append("| URL | Status | Linked From |")
         lines.append("|-----|--------|-------------|")
         for url in broken:
-            s = next((p.get("status_code","?") for p in pages if p.get("url") == url), "?")
+            pg = next((p for p in pages if p.get("url") == url), {})
+            s = pg.get("status_code", "?")
+            if _fetch_error(pg) and pg:
+                s = f"{s} ({_fetch_error(pg)})"
             sources = inbound.get(url, [])
             src_str = ", ".join(f"`{s}`" for s in sources[:3])
             if len(sources) > 3:
@@ -1789,13 +1792,14 @@ def _write_per_page_csv(pages: list, output_path: "Path") -> dict:
     """Write a CSV with one row per crawled URL × all failed checks.
 
     Columns: url, status_code, depth, word_count, response_time_ms, title, meta_description,
-             then a column for each check (1=failed, 0=passed), then 'failed_checks_count'
-             and 'failed_checks_list' (semicolon-separated).
+             then a column for each check (1=failed, 0=passed), then 'failed_checks_count',
+             'failed_checks_list' (semicolon-separated) and 'fetch_error' (why a page with
+             status 0 got no response: timeout, dns_not_found, ssl_error, ...).
     """
     import csv
     check_cols = [name for name, _ in _PER_PAGE_CHECKS]
     cols = ["url", "status_code", "depth", "word_count", "response_time_ms",
-            "title", "meta_description"] + check_cols + ["failed_checks_count", "failed_checks_list"]
+            "title", "meta_description"] + check_cols + ["failed_checks_count", "failed_checks_list", "fetch_error"]
 
     rows = 0
     with open(output_path, "w", newline="", encoding="utf-8") as f:
@@ -1815,9 +1819,20 @@ def _write_per_page_csv(pages: list, output_path: "Path") -> dict:
                 *checks_bits,
                 len(failed),
                 ";".join(failed),
+                _fetch_error(p),
             ])
             rows += 1
     return {"path": str(output_path), "rows": rows, "columns": len(cols)}
+
+
+def _fetch_error(p: dict) -> str:
+    """Why a page has no HTTP status. Empty for pages that answered."""
+    try:
+        if int(p.get("status_code") or 0) > 0:
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(p.get("error_type") or "no_response")
 
 
 def _safe_pred(pred, page) -> bool:

@@ -12,6 +12,11 @@
   document or asset extensions skip page-level checks (title, H1, viewport), so an image is not
   flagged for a missing H1.
 - A page cap is now exact: upstream could return one page over `total_max_pages`.
+- **Response times are server latency.** Upstream stamped `response_time` after parsing the page
+  and HEAD-checking every image on it, so a page served in 2s read as 18s and 57 of 60 pages on a
+  live audit were flagged slow. The bundled upstream patch now records `response.elapsed`.
+- A page with status 0 now says why (`timeout`, `dns_not_found`, `ssl_error`, `no_response`) in
+  the Broken Pages table and in a new `fetch_error` column of the per-page CSV.
 - `librecrawl_get_settings` returns the crawl-shaping settings only. Pass `full=True` for the
   whole dict, including the ~2,500 token default exclusion lists.
 

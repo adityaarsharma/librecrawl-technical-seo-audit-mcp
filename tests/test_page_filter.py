@@ -119,3 +119,15 @@ def test_cap_overshoot_is_trimmed(finalize_env):
     pages = [dict(_p("https://a.test/"), depth=0), _p("https://a.test/a"), _p("https://a.test/b")]
     sess, _ = finalize_env(pages, max_pages=2)
     assert sess["pages_done"] == 2
+
+
+def test_status_zero_shows_its_fetch_error(tmp_path):
+    import csv
+    pages = [_p("https://a.test/", depth=0), _p("https://a.test/t", "", 0, error_type="timeout"),
+             _p("https://a.test/u", "", 0)]
+    out = tmp_path / "pp.csv"
+    server._write_per_page_csv(pages, out)
+    rows = {r["url"]: r["fetch_error"] for r in csv.DictReader(open(out))}
+    assert rows == {"https://a.test/": "", "https://a.test/t": "timeout", "https://a.test/u": "no_response"}
+    md = server._build_report(pages, "https://a.test/", 1, site_data={}, links=[])
+    assert "| `https://a.test/t` | 0 (timeout) |" in md

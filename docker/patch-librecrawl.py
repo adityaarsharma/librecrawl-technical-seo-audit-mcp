@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply the session-persistence patch to upstream LibreCrawl's main.py.
+"""Apply the MCP's patches to upstream LibreCrawl (main.py, src/crawl_db.py, src/crawler.py).
 
 Without this patch LibreCrawl reads `session_id` BEFORE `get_or_create_crawler()`
 creates it, so `crawl_id` is always null and crawl results are never written to
@@ -67,3 +67,28 @@ elif old3 not in db_src:
 else:
     open(crawl_db, "w", encoding="utf-8", newline="").write(db_src.replace(old3, new3, 1))
     print("delete_crawl child-row patch applied")
+
+# ── Patch 3: response_time must be server latency ───────────────────────────
+# Upstream stamps response_time after parsing the page and HEAD-checking every
+# image on it, so a page the server answered in 2s reads as 18s and nearly
+# every page is flagged slow. In the requests path, use the time the server
+# took to return its headers (requests' `response.elapsed`).
+crawler_py = os.path.join(os.path.dirname(os.path.abspath(path)), "src", "crawler.py")
+cr_src = open(crawler_py, encoding="utf-8", newline="").read()  # keep upstream CRLF
+
+old4 = "result['response_time'] = round((time.time() - start_time) * 1000, 2)"
+new4 = "result['response_time'] = round(response.elapsed.total_seconds() * 1000, 2)"
+start = cr_src.find("def _crawl_url_with_requests")
+end = cr_src.find("def _crawl_url_with_javascript")
+
+if start < 0 or end < start:
+    sys.exit("response_time patch: upstream code changed, patch did not apply")
+section = cr_src[start:end]
+if new4 in section:
+    print("response_time patch already applied — skipping")
+elif section.count(old4) != 1:
+    sys.exit("response_time patch: upstream code changed, patch did not apply")
+else:
+    cr_src = cr_src[:start] + section.replace(old4, new4, 1) + cr_src[end:]
+    open(crawler_py, "w", encoding="utf-8", newline="").write(cr_src)
+    print("response_time patch applied")
